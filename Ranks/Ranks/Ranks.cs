@@ -64,7 +64,6 @@ public class Ranks : BasePlugin
         RegisterEventHandler<EventPlayerHurt>(EventPlayerHurt);
         RegisterEventHandler<EventPlayerDeath>(EventPlayerDeath);
         RegisterEventHandler<EventPlayerDisconnect>(EventPlayerDisconnect);
-        RegisterEventHandler<EventPlayerTeam>(EventPlayerTeam);
         
         RegisterEventHandler<EventRoundStart>(EventRoundStart);
         RegisterEventHandler<EventRoundEnd>(EventRoundEnd);
@@ -245,8 +244,6 @@ public class Ranks : BasePlugin
             var steamId = new SteamID(player.SteamID);
             var totalTime = GetTotalTime(player.Slot);
 
-            if (player.Team is CsTeam.Spectator) continue;
-
             Task.Run(() =>
                 Database.UpdateUserStatsDb(steamId, user, totalTime, DateTimeOffset.Now.ToUnixTimeSeconds()));
             //Task.Run(OnMapStartAsync);
@@ -382,31 +379,11 @@ public class Ranks : BasePlugin
             var totalTime = GetTotalTime(player.Slot);
             _loginTime[player.Slot] = DateTime.MinValue;
 
-            if (player.Team is CsTeam.Spectator)
-                totalTime = TimeSpan.Zero;
-
             user.name = player.PlayerName;
             Task.Run(() =>
                 Database.UpdateUserStatsDb(steamId, user, totalTime, DateTimeOffset.Now.ToUnixTimeSeconds()));
             Users.Remove(player.SteamID, out var _);
         }
-
-        return HookResult.Continue;
-    }
-
-    private HookResult EventPlayerTeam(EventPlayerTeam @event, GameEventInfo info)
-    {
-        var player = @event.Userid;
-
-        if (player is null || !player.IsValid || player.IsBot) return HookResult.Continue;
-
-        var totalTime = GetTotalTime(player.Slot);
-        if ((CsTeam)@event.Oldteam is CsTeam.Spectator) return HookResult.Continue;
-        if (!Users.TryGetValue(player.SteamID, out var user)) return HookResult.Continue;
-
-        var steamId = new SteamID(player.SteamID);
-        Task.Run(() =>
-            Database.UpdateUserStatsDb(steamId, user, totalTime, DateTimeOffset.Now.ToUnixTimeSeconds()));
 
         return HookResult.Continue;
     }
