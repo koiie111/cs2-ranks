@@ -41,6 +41,8 @@ public class RanksFakeRank : BasePlugin
                 {
                     rankType = 11;
                     rankValue = _api.GetPlayerExperience(player);
+                    if (rankValue >= 99999)
+                        rankValue = 99999;
                 }
                 else
                 {
