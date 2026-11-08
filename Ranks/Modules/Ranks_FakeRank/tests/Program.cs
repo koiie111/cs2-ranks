@@ -1,4 +1,5 @@
 using Ranks_FakeRank;
+using CounterStrikeSharp.API;
 
 var ranks = new Dictionary<int, int> { [1] = 10, [2] = 20, [18] = 180 };
 var max = RankProjection.MaxRank(ranks);
@@ -10,7 +11,9 @@ Check(RankProjection.Project(1, 0, ranks, max) == 10, "zero rank");
 Check(RankProjection.Project(1, -1, ranks, max) == 10, "unloaded rank");
 Check(RankProjection.Project(1, 2, ranks, max) == 20, "rank mapping");
 Check(RankProjection.Project(1, 100, ranks, max) == 180, "upper rank clamp");
-Console.WriteLine("8 FakeRank projection checks passed");
+Check(((PlayerButtons.Scoreboard | PlayerButtons.Forward) & PlayerButtons.Scoreboard) != 0, "TAB while moving");
+Check((PlayerButtons.Forward & PlayerButtons.Scoreboard) == 0, "movement without TAB");
+Console.WriteLine("10 FakeRank projection/button checks passed");
 
 static void Check(bool success, string name)
 {
