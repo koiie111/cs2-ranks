@@ -25,6 +25,7 @@ public class RanksFakeRank : BasePlugin
         TryInitialize();
         AddTimer(0.25f, Reconcile, TimerFlags.REPEAT);
         RegisterListener<Listeners.OnPlayerButtonsChanged>(OnButtonsChanged);
+        RegisterListener<Listeners.OnTick>(RevealWhileHeld);
         RegisterListener<Listeners.OnMapStart>(_ => _applied.Clear());
         RegisterEventHandler<EventPlayerDisconnect>((e, _) =>
         {
@@ -98,6 +99,19 @@ public class RanksFakeRank : BasePlugin
         var filter = new RecipientFilter();
         filter.Add(player);
         SendReveal(filter);
+    }
+
+    private void RevealWhileHeld()
+    {
+        if (_config == null) return;
+        RecipientFilter? filter = null;
+        foreach (var player in Utilities.GetPlayers())
+        {
+            if (!Eligible(player) || (player!.Buttons & PlayerButtons.Scoreboard) == 0) continue;
+            filter ??= new RecipientFilter();
+            filter.Add(player);
+        }
+        if (filter is { Count: > 0 }) SendReveal(filter);
     }
 
     private static void SendReveal(RecipientFilter filter) =>
