@@ -11,9 +11,10 @@ Check(RankProjection.Project(1, 0, ranks, max) == 10, "zero rank");
 Check(RankProjection.Project(1, -1, ranks, max) == 10, "unloaded rank");
 Check(RankProjection.Project(1, 2, ranks, max) == 20, "rank mapping");
 Check(RankProjection.Project(1, 100, ranks, max) == 180, "upper rank clamp");
+Check(RankProjection.Project(1, 1, new Dictionary<int, int> { [1] = 120000 }, 1) == 99999, "installed rank value ceiling");
 Check(((PlayerButtons.Scoreboard | PlayerButtons.Forward) & PlayerButtons.Scoreboard) != 0, "TAB while moving");
 Check((PlayerButtons.Forward & PlayerButtons.Scoreboard) == 0, "movement without TAB");
-Console.WriteLine("10 FakeRank projection/button checks passed");
+Console.WriteLine("11 FakeRank projection/button checks passed");
 
 static void Check(bool success, string name)
 {

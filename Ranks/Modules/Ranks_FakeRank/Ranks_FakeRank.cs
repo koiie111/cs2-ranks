@@ -57,37 +57,25 @@ public class RanksFakeRank : BasePlugin
     private static bool Eligible(CCSPlayerController? player) =>
         player is { IsValid: true, Connected: PlayerConnectedState.PlayerConnected, IsBot: false, IsHLTV: false };
 
-    private bool UpdatePlayer(CCSPlayerController player)
+    private void UpdatePlayer(CCSPlayerController player)
     {
-        if (_api == null || _config == null) return false;
+        if (_api == null || _config == null) return;
         var raw = _config.Type == 0 ? _api.GetPlayerExperience(player) : _api.GetPlayerRank(player);
         var value = RankProjection.Project(_config.Type, raw, _config.FakeRank, _maxRank);
         var type = (sbyte)(_config.Type == 0 ? 11 : 12);
         var identity = new PlayerIdentity(player.SteamID, player.UserId);
         var next = new AppliedRank(identity, 111, type, value);
-        var changed = !_applied.TryGetValue(player.Slot, out var previous) || previous != next;
-        if (changed || player.CompetitiveWins != 111) player.CompetitiveWins = 111;
-        if (changed || player.CompetitiveRankType != type) player.CompetitiveRankType = type;
-        if (changed || player.CompetitiveRanking != value) player.CompetitiveRanking = value;
         _applied[player.Slot] = next;
-        return changed;
     }
 
     private void Reconcile()
     {
         if (!TryInitialize()) return;
-        RecipientFilter? filter = null;
         foreach (var player in Utilities.GetPlayers())
         {
             if (!Eligible(player)) continue;
-            var changed = UpdatePlayer(player!);
-            if (changed && (player!.Buttons & PlayerButtons.Scoreboard) != 0)
-            {
-                filter ??= new RecipientFilter();
-                filter.Add(player);
-            }
+            UpdatePlayer(player!);
         }
-        if (filter is { Count: > 0 }) SendReveal(filter);
     }
 
     private void OnButtonsChanged(CCSPlayerController player, PlayerButtons pressed, PlayerButtons released)
@@ -95,7 +83,11 @@ public class RanksFakeRank : BasePlugin
         if ((pressed & PlayerButtons.Scoreboard) == 0 || !Eligible(player) || !TryInitialize()) return;
         // RevealAll includes every player: refresh values before sending.
         foreach (var other in Utilities.GetPlayers())
-            if (Eligible(other)) UpdatePlayer(other!);
+            if (Eligible(other))
+            {
+                UpdatePlayer(other!);
+                Apply(other!, _applied[other!.Slot]);
+            }
         var filter = new RecipientFilter();
         filter.Add(player);
         SendReveal(filter);
@@ -107,15 +99,34 @@ public class RanksFakeRank : BasePlugin
         RecipientFilter? filter = null;
         foreach (var player in Utilities.GetPlayers())
         {
-            if (!Eligible(player) || (player!.Buttons & PlayerButtons.Scoreboard) == 0) continue;
-            filter ??= new RecipientFilter();
-            filter.Add(player);
+            if (!Eligible(player)) continue;
+            if (!_applied.TryGetValue(player!.Slot, out var rank) ||
+                rank.Identity != new PlayerIdentity(player.SteamID, player.UserId))
+            {
+                UpdatePlayer(player);
+                rank = _applied[player.Slot];
+            }
+            // CS2 may replace these network fields during a frame. Preserve the
+            // baseline write point; only the Core lookup/calculation is throttled.
+            Apply(player, rank);
+            if ((player.Buttons & PlayerButtons.Scoreboard) != 0)
+            {
+                filter ??= new RecipientFilter();
+                filter.Add(player);
+            }
         }
         if (filter is { Count: > 0 }) SendReveal(filter);
     }
 
     private static void SendReveal(RecipientFilter filter) =>
         UserMessage.FromPartialName("CCSUsrMsg_ServerRankRevealAll").Send(filter);
+
+    private static void Apply(CCSPlayerController player, AppliedRank rank)
+    {
+        player.CompetitiveWins = rank.Wins;
+        player.CompetitiveRankType = rank.Type;
+        player.CompetitiveRanking = rank.Value;
+    }
 }
 
 internal readonly record struct PlayerIdentity(ulong SteamId, int? UserId);
@@ -133,7 +144,7 @@ public static class RankProjection
     public static int Project(int type, int raw, IReadOnlyDictionary<int, int> fakeRanks, int maxRank)
     {
         if (type == 0) return Math.Min(raw, 99999);
-        return fakeRanks[Math.Clamp(raw, 1, maxRank)];
+        return Math.Min(fakeRanks[Math.Clamp(raw, 1, maxRank)], 99999);
     }
 }
 
