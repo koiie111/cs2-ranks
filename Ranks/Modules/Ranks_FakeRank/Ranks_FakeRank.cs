@@ -1,10 +1,13 @@
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes;
+using CounterStrikeSharp.API.Modules.Commands;
+using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Timers;
 using CounterStrikeSharp.API.Modules.UserMessages;
 using CounterStrikeSharp.API.Modules.Utils;
 using RanksApi;
+using Microsoft.Extensions.Logging;
 
 namespace Ranks_FakeRank;
 
@@ -13,13 +16,16 @@ public class RanksFakeRank : BasePlugin
 {
     public override string ModuleAuthor => "thesamefabius";
     public override string ModuleName => "[Ranks] Fake Rank";
-    public override string ModuleVersion => "v1.0.2-perf.1";
+    public override string ModuleVersion => "v1.0.3-replication.1";
 
     private Config? _config;
     private IRanksApi? _api;
     private int _maxRank;
     private readonly Dictionary<int, AppliedRank> _applied = new();
+    private readonly RankReplication _replication = new();
     private readonly List<CCSPlayerController> _viewers = new();
+    private long _reveals;
+    private DateTime _nextErrorLog;
 
     public override void OnAllPluginsLoaded(bool hotReload)
     {
@@ -27,10 +33,14 @@ public class RanksFakeRank : BasePlugin
         AddTimer(0.25f, Reconcile, TimerFlags.REPEAT);
         RegisterListener<Listeners.OnPlayerButtonsChanged>(OnButtonsChanged);
         RegisterListener<Listeners.OnTick>(RevealWhileHeld);
-        RegisterListener<Listeners.OnMapStart>(_ => _applied.Clear());
+        RegisterListener<Listeners.OnMapStart>(_ => ClearState());
         RegisterEventHandler<EventPlayerDisconnect>((e, _) =>
         {
-            if (e.Userid != null) _applied.Remove(e.Userid.Slot);
+            if (e.Userid != null)
+            {
+                _applied.Remove(e.Userid.Slot);
+                _replication.Remove(e.Userid.Slot);
+            }
             return HookResult.Continue;
         });
         RegisterEventHandler<EventPlayerSpawn>((e, _) =>
@@ -43,24 +53,28 @@ public class RanksFakeRank : BasePlugin
             if (player != null || _api == null) return;
             _config = _api.LoadConfig<Config>("ranks_fakerank");
             _maxRank = RankProjection.MaxRank(_config.FakeRank);
-            _applied.Clear();
+            ClearState();
             Reconcile();
         });
+        AddCommand("css_fakerank_status", "Show FakeRank replication diagnostics (server console only)", PrintStatus);
     }
 
     public override void Unload(bool hotReload)
     {
         if (_api != null) _api.RankChanged -= OnRankChanged;
         _viewers.Clear();
-        _applied.Clear();
+        ClearState();
     }
 
     private bool TryInitialize()
     {
         if (_api != null && _config != null) return true;
-        _api = IRanksApi.Capability.Get();
-        if (_api == null) return false;
-        _config = _api.LoadConfig<Config>("ranks_fakerank");
+        IRanksApi? api;
+        try { api = IRanksApi.Capability.Get(); }
+        catch (KeyNotFoundException) { return false; }
+        if (api == null) return false;
+        _config = api.LoadConfig<Config>("ranks_fakerank");
+        _api = api;
         _maxRank = RankProjection.MaxRank(_config.FakeRank);
         _api.RankChanged += OnRankChanged;
         return true;
@@ -73,13 +87,15 @@ public class RanksFakeRank : BasePlugin
     {
         if (_api == null || _config == null) return;
         var raw = _config.Type == 0 ? _api.GetPlayerExperience(player) : _api.GetPlayerRank(player);
-        var value = RankProjection.Project(_config.Type, raw, _config.FakeRank, _maxRank);
+        if (!RankProjection.TryProject(_config.Type, raw, _config.FakeRank, _maxRank, out var value))
+        {
+            _applied.Remove(player.Slot);
+            return;
+        }
         var type = (sbyte)(_config.Type == 0 ? 11 : 12);
-        var identity = new PlayerIdentity(player.SteamID, player.UserId);
-        var next = new AppliedRank(identity, 111, type, value);
-        if (force || !_applied.TryGetValue(player.Slot, out var previous) || previous != next)
-            Apply(player, next);
+        var next = new AppliedRank(Identity(player), new RankValues(111, type, value));
         _applied[player.Slot] = next;
+        Apply(player, next, force);
     }
 
     private void OnRankChanged(CCSPlayerController player, int _, bool __)
@@ -90,7 +106,7 @@ public class RanksFakeRank : BasePlugin
     private void ApplyCached(CCSPlayerController player)
     {
         if (!_applied.TryGetValue(player.Slot, out var rank) ||
-            rank.Identity != new PlayerIdentity(player.SteamID, player.UserId))
+            rank.Identity != Identity(player))
             UpdatePlayer(player, force: true);
         else
             Apply(player, rank);
@@ -102,9 +118,8 @@ public class RanksFakeRank : BasePlugin
         foreach (var player in Utilities.GetPlayers())
         {
             if (!Eligible(player)) continue;
-            // Keep the client's rank fields warm before the first TAB packet.
-            // Earlier 4 Hz-only candidates failed; held TAB still writes each tick.
-            UpdatePlayer(player!, force: true);
+            // Poll direct API XP writes too; Apply also detects live controller drift.
+            UpdatePlayer(player!);
         }
     }
 
@@ -115,7 +130,7 @@ public class RanksFakeRank : BasePlugin
         foreach (var other in Utilities.GetPlayers())
             if (Eligible(other))
             {
-                UpdatePlayer(other!, force: true);
+                UpdatePlayer(other!);
             }
         var filter = new RecipientFilter();
         filter.Add(player);
@@ -134,8 +149,8 @@ public class RanksFakeRank : BasePlugin
         }
         if (_viewers.Count == 0) return;
 
-        // The tested build needed per-tick field writes while TAB was held.
-        // Refresh all visible ranks before revealing, including late joiners.
+        // Preserve the existing per-tick reveal cadence for the replication A/B.
+        // Fields are written/notified only for a new value or observed live drift.
         var filter = new RecipientFilter();
         foreach (var viewer in _viewers) filter.Add(viewer);
         foreach (var player in Utilities.GetPlayers())
@@ -143,22 +158,86 @@ public class RanksFakeRank : BasePlugin
         SendReveal(filter);
     }
 
-    private static void SendReveal(RecipientFilter filter) =>
-        UserMessage.FromPartialName("CCSUsrMsg_ServerRankRevealAll").Send(filter);
-
-    private static void Apply(CCSPlayerController player, AppliedRank rank)
+    private void SendReveal(RecipientFilter filter)
     {
-        player.CompetitiveWins = rank.Wins;
-        player.CompetitiveRankType = rank.Type;
-        player.CompetitiveRanking = rank.Value;
+        using var message = UserMessage.FromPartialName("CCSUsrMsg_ServerRankRevealAll");
+        message.Send(filter);
+        _reveals++;
+    }
+
+    private void Apply(CCSPlayerController player, AppliedRank rank, bool force = false)
+    {
+        try { _replication.Apply(player.Slot, rank, new ControllerRankFields(player), force); }
+        catch (Exception ex)
+        {
+            if (DateTime.UtcNow < _nextErrorLog) return;
+            _nextErrorLog = DateTime.UtcNow.AddSeconds(10);
+            Logger.LogError(ex, "FakeRank replication failed for slot {Slot}; will retry", player.Slot);
+        }
+    }
+
+    private static PlayerIdentity Identity(CCSPlayerController player) => new(player.SteamID, player.UserId, player.Handle);
+
+    private void ClearState()
+    {
+        _applied.Clear();
+        _replication.Clear();
+    }
+
+    private void PrintStatus(CCSPlayerController? caller, CommandInfo command)
+    {
+        if (caller != null) return;
+        int? slot = null;
+        if (command.ArgCount > 2 || command.ArgCount == 2 &&
+            (!int.TryParse(command.GetArg(1), out var parsed) || parsed < 0))
+        {
+            command.ReplyToCommand("Usage: css_fakerank_status [slot 0-based]");
+            return;
+        }
+        if (command.ArgCount == 2) slot = int.Parse(command.GetArg(1));
+        command.ReplyToCommand($"[FakeRank] version={ModuleVersion} api={_api != null} config={_config != null} mode={_config?.Type} checks={_replication.Checks} applied={_replication.Applied} skipped={_replication.Skipped} notifications={_replication.Notifications} drift={_replication.DriftRepairs} failures={_replication.Failures} reveals={_reveals}");
+        command.ReplyToCommand($"[FakeRank] networked wins={Schema.IsSchemaFieldNetworked("CCSPlayerController", "m_iCompetitiveWins")} type={Schema.IsSchemaFieldNetworked("CCSPlayerController", "m_iCompetitiveRankType")} value={Schema.IsSchemaFieldNetworked("CCSPlayerController", "m_iCompetitiveRanking")}");
+        foreach (var player in Utilities.GetPlayers())
+        {
+            if (!Eligible(player) || slot.HasValue && player.Slot != slot.Value) continue;
+            var raw = _api == null || _config == null ? -1 : _config.Type == 0 ? _api.GetPlayerExperience(player) : _api.GetPlayerRank(player);
+            int expectedValue = 0;
+            var ready = _config != null && RankProjection.TryProject(_config.Type, raw, _config.FakeRank, _maxRank, out expectedValue);
+            var expected = ready ? new RankValues(111, (sbyte)(_config!.Type == 0 ? 11 : 12), expectedValue).ToString() : "waiting";
+            var live = new ControllerRankFields(player).Read();
+            command.ReplyToCommand($"[FakeRank] slot={player.Slot} userid={player.UserId} steam={player.SteamID} raw={raw} expected={expected} live={live} notified={_replication.LastNotified(player.Slot)}");
+        }
+    }
+
+    private readonly struct ControllerRankFields(CCSPlayerController player) : ICompetitiveRankFields
+    {
+        public RankValues Read() => new(player.CompetitiveWins, player.CompetitiveRankType, player.CompetitiveRanking);
+        public void Write(RankValues values)
+        {
+            player.CompetitiveWins = values.Wins;
+            player.CompetitiveRankType = values.Type;
+            player.CompetitiveRanking = values.Value;
+        }
+        public void Notify(RankFields field) => Utilities.SetStateChanged(player, "CCSPlayerController", field switch
+        {
+            RankFields.Wins => "m_iCompetitiveWins",
+            RankFields.Type => "m_iCompetitiveRankType",
+            RankFields.Value => "m_iCompetitiveRanking",
+            _ => throw new ArgumentOutOfRangeException(nameof(field))
+        });
     }
 }
 
-internal readonly record struct PlayerIdentity(ulong SteamId, int? UserId);
-internal readonly record struct AppliedRank(PlayerIdentity Identity, int Wins, sbyte Type, int Value);
-
 public static class RankProjection
 {
+    public static bool TryProject(int type, int raw, IReadOnlyDictionary<int, int> fakeRanks, int maxRank, out int value)
+    {
+        value = 0;
+        if (raw < 0) return false; // RanksApi uses -1 while this player's data is unavailable.
+        value = Project(type, raw, fakeRanks, maxRank);
+        return true;
+    }
+
     public static int MaxRank(IReadOnlyDictionary<int, int> fakeRanks)
     {
         var max = 1;
