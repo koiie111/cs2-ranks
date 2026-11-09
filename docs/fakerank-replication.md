@@ -1,6 +1,6 @@
 # Stable FakeRank display
 
-Branch: `codex/fix-fakerank-replication`. Current pilot module: `v1.0.3-replication.3`.
+Branch: `codex/fix-fakerank-replication`. Module: `v1.0.3-replication.3`.
 
 ## Cause and correction
 
@@ -63,10 +63,11 @@ These visual results cover candidate 2. The owner subsequently reproduced brief
 row mixing on the initial TAB draw/new-player entry, which settles while held.
 A single native reveal and a reversible unique-wins test did not fix that case.
 Candidate 3 passed regression tests and maintains correct live values on #8
-while TAB is closed, but its visual first-draw acceptance is pending. Other
-23 running managed servers plus offline #16 retain candidate 2. Native
-twelve-tick input polling was not changed or claimed fixed. Unit tests do not
-emulate CS2 rendering; no full active-load or multiple-observer claim is made.
+while TAB is closed. With two real players already connected, the owner then
+confirmed smooth initial TAB display after connecting and repeated opening.
+This is the accepted final candidate. Native twelve-tick input polling was not
+changed. Unit tests do not emulate CS2 rendering; no full active-load or
+multiple-observer performance claim is made.
 
 ## Artifact and operations
 
