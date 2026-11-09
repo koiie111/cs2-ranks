@@ -15,7 +15,7 @@ public class RanksFakeRank : BasePlugin
 {
     public override string ModuleAuthor => "thesamefabius";
     public override string ModuleName => "[Ranks] Fake Rank";
-    public override string ModuleVersion => "v1.0.3-replication.2";
+    public override string ModuleVersion => "v1.0.3-replication.3";
 
     private Config? _config;
     private IRanksApi? _api;
@@ -29,7 +29,7 @@ public class RanksFakeRank : BasePlugin
         TryInitialize();
         AddTimer(0.25f, Reconcile, TimerFlags.REPEAT);
         RegisterListener<Listeners.OnPlayerButtonsChanged>(OnButtonsChanged);
-        RegisterListener<Listeners.OnTick>(ReconcileWhileHeld);
+        RegisterListener<Listeners.OnTick>(ReconcileCached);
         RegisterListener<Listeners.OnMapStart>(_ => ClearState());
         RegisterEventHandler<EventPlayerDisconnect>((e, _) =>
         {
@@ -132,22 +132,13 @@ public class RanksFakeRank : BasePlugin
         // packets cause client-side rank flicker even with stable controller fields.
     }
 
-    private void ReconcileWhileHeld()
+    private void ReconcileCached()
     {
         if (_config == null) return;
-        var scoreboardOpen = false;
-        foreach (var player in Utilities.GetPlayers())
-        {
-            if (!Eligible(player)) continue;
-            if ((player.Buttons & PlayerButtons.Scoreboard) != 0)
-            {
-                scoreboardOpen = true;
-                break;
-            }
-        }
-        if (!scoreboardOpen) return;
 
-        // Keep visible fields synchronized without re-triggering client disclosure.
+        // The client opens TAB before its input reaches the server. Keep native
+        // fields warm even while TAB is closed, so disclosure never starts from
+        // the engine's cleared fields between the 0.25-second API polls.
         foreach (var player in Utilities.GetPlayers())
             if (Eligible(player)) ApplyCached(player!);
     }
@@ -182,7 +173,7 @@ public class RanksFakeRank : BasePlugin
             return;
         }
         if (command.ArgCount == 2) slot = int.Parse(command.GetArg(1));
-        command.ReplyToCommand($"[FakeRank] version={ModuleVersion} api={_api != null} config={_config != null} mode={_config?.Type} checks={_replication.Checks} applied={_replication.Applied} skipped={_replication.Skipped} notifications={_replication.Notifications} drift={_replication.DriftRepairs} failures={_replication.Failures} reveal=external-metamod");
+        command.ReplyToCommand($"[FakeRank] version={ModuleVersion} api={_api != null} config={_config != null} mode={_config?.Type} checks={_replication.Checks} applied={_replication.Applied} skipped={_replication.Skipped} notifications={_replication.Notifications} drift={_replication.DriftRepairs} failures={_replication.Failures} reveal=external-metamod sync=continuous");
         command.ReplyToCommand($"[FakeRank] networked wins={Schema.IsSchemaFieldNetworked("CCSPlayerController", "m_iCompetitiveWins")} type={Schema.IsSchemaFieldNetworked("CCSPlayerController", "m_iCompetitiveRankType")} value={Schema.IsSchemaFieldNetworked("CCSPlayerController", "m_iCompetitiveRanking")}");
         foreach (var player in Utilities.GetPlayers())
         {

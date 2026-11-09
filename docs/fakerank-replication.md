@@ -1,6 +1,6 @@
 # Stable FakeRank display
 
-Branch: `codex/fix-fakerank-replication`. Module: `v1.0.3-replication.2`.
+Branch: `codex/fix-fakerank-replication`. Current pilot module: `v1.0.3-replication.3`.
 
 ## Cause and correction
 
@@ -18,6 +18,13 @@ includes slot, SteamID, UserID and controller handle. Disconnect/map/config
 reload invalidate caches; spawn forces notification. Failed notifications retry.
 Unavailable player data is withheld. Wins=111, projections, modes, RanksApi,
 JSON configuration and databases remain unchanged.
+
+Candidate 3 also reconciles cached fields on every tick while TAB is closed.
+The engine can clear wins/rating between 0.25-second API polls. Waiting for the
+scoreboard button to reach the server permits a stale first local draw; cached
+field recovery therefore must run before that input, without another reveal.
+Authoritative API polling remains at 0.25 seconds. Unchanged live values still
+produce no writes/notifications.
 
 All inspected managed installations already have native FakeRanks-RevealAll.
 This release depends on that division of responsibilities. The native binary
@@ -52,15 +59,22 @@ three stable icons. All test bots retained wins=111: unique wins were unnecessar
 The main post-change probe ran for over 6 minutes, with zero replication failures.
 The temporary probe is manually loaded from disabled and removed after testing.
 
-Limitations: this is a real-client/multi-row causal test rather than a multiple
-real-observer or active-load test. Initial connection/round transition briefly
-showed unstable or delayed disclosure before settling. Native twelve-tick input
-polling was not changed or claimed fixed. Unit tests do not emulate CS2 rendering.
+These visual results cover candidate 2. The owner subsequently reproduced brief
+row mixing on the initial TAB draw/new-player entry, which settles while held.
+A single native reveal and a reversible unique-wins test did not fix that case.
+Candidate 3 passed regression tests and maintains correct live values on #8
+while TAB is closed, but its visual first-draw acceptance is pending. Other
+23 running managed servers plus offline #16 retain candidate 2. Native
+twelve-tick input polling was not changed or claimed fixed. Unit tests do not
+emulate CS2 rendering; no full active-load or multiple-observer claim is made.
 
 ## Artifact and operations
 
-Frozen DLL SHA256:
+Candidate 2 frozen DLL SHA256:
 `00e1247ff38b8fc13588c4659e2565597fcffb9a4cbc3ed21d0055bc0fd8ccc5`.
+
+Candidate 3 pilot DLL SHA256:
+`325456d84cc4933ad17f2c4d6304238d8c5854bf4baa7d94cb3e1e9918d92913`.
 
 `css_fakerank_status [slot]` is server-console/RCON only. It reports readiness,
 networked schema flags, desired/live/notified values, failures/repairs and
