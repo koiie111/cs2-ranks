@@ -102,7 +102,9 @@ public class RanksFakeRank : BasePlugin
         foreach (var player in Utilities.GetPlayers())
         {
             if (!Eligible(player)) continue;
-            UpdatePlayer(player!);
+            // Keep the client's rank fields warm before the first TAB packet.
+            // Earlier 4 Hz-only candidates failed; held TAB still writes each tick.
+            UpdatePlayer(player!, force: true);
         }
     }
 
