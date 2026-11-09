@@ -19,6 +19,7 @@ public class RanksFakeRank : BasePlugin
     private IRanksApi? _api;
     private int _maxRank;
     private readonly Dictionary<int, AppliedRank> _applied = new();
+    private readonly List<CCSPlayerController> _viewers = new();
 
     public override void OnAllPluginsLoaded(bool hotReload)
     {
@@ -32,6 +33,11 @@ public class RanksFakeRank : BasePlugin
             if (e.Userid != null) _applied.Remove(e.Userid.Slot);
             return HookResult.Continue;
         });
+        RegisterEventHandler<EventPlayerSpawn>((e, _) =>
+        {
+            if (Eligible(e.Userid)) UpdatePlayer(e.Userid!, force: true);
+            return HookResult.Continue;
+        });
         AddCommand("css_fakerank_reload", "", (player, _) =>
         {
             if (player != null || _api == null) return;
@@ -42,7 +48,12 @@ public class RanksFakeRank : BasePlugin
         });
     }
 
-    public override void Unload(bool hotReload) => _applied.Clear();
+    public override void Unload(bool hotReload)
+    {
+        if (_api != null) _api.RankChanged -= OnRankChanged;
+        _viewers.Clear();
+        _applied.Clear();
+    }
 
     private bool TryInitialize()
     {
@@ -51,13 +62,14 @@ public class RanksFakeRank : BasePlugin
         if (_api == null) return false;
         _config = _api.LoadConfig<Config>("ranks_fakerank");
         _maxRank = RankProjection.MaxRank(_config.FakeRank);
+        _api.RankChanged += OnRankChanged;
         return true;
     }
 
     private static bool Eligible(CCSPlayerController? player) =>
         player is { IsValid: true, Connected: PlayerConnectedState.PlayerConnected, IsBot: false, IsHLTV: false };
 
-    private void UpdatePlayer(CCSPlayerController player)
+    private void UpdatePlayer(CCSPlayerController player, bool force = false)
     {
         if (_api == null || _config == null) return;
         var raw = _config.Type == 0 ? _api.GetPlayerExperience(player) : _api.GetPlayerRank(player);
@@ -65,7 +77,23 @@ public class RanksFakeRank : BasePlugin
         var type = (sbyte)(_config.Type == 0 ? 11 : 12);
         var identity = new PlayerIdentity(player.SteamID, player.UserId);
         var next = new AppliedRank(identity, 111, type, value);
+        if (force || !_applied.TryGetValue(player.Slot, out var previous) || previous != next)
+            Apply(player, next);
         _applied[player.Slot] = next;
+    }
+
+    private void OnRankChanged(CCSPlayerController player, int _, bool __)
+    {
+        if (Eligible(player)) UpdatePlayer(player);
+    }
+
+    private void ApplyCached(CCSPlayerController player)
+    {
+        if (!_applied.TryGetValue(player.Slot, out var rank) ||
+            rank.Identity != new PlayerIdentity(player.SteamID, player.UserId))
+            UpdatePlayer(player, force: true);
+        else
+            Apply(player, rank);
     }
 
     private void Reconcile()
@@ -85,8 +113,7 @@ public class RanksFakeRank : BasePlugin
         foreach (var other in Utilities.GetPlayers())
             if (Eligible(other))
             {
-                UpdatePlayer(other!);
-                Apply(other!, _applied[other!.Slot]);
+                UpdatePlayer(other!, force: true);
             }
         var filter = new RecipientFilter();
         filter.Add(player);
@@ -96,26 +123,22 @@ public class RanksFakeRank : BasePlugin
     private void RevealWhileHeld()
     {
         if (_config == null) return;
-        RecipientFilter? filter = null;
+        _viewers.Clear();
         foreach (var player in Utilities.GetPlayers())
         {
             if (!Eligible(player)) continue;
-            if (!_applied.TryGetValue(player!.Slot, out var rank) ||
-                rank.Identity != new PlayerIdentity(player.SteamID, player.UserId))
-            {
-                UpdatePlayer(player);
-                rank = _applied[player.Slot];
-            }
-            // CS2 may replace these network fields during a frame. Preserve the
-            // baseline write point; only the Core lookup/calculation is throttled.
-            Apply(player, rank);
             if ((player.Buttons & PlayerButtons.Scoreboard) != 0)
-            {
-                filter ??= new RecipientFilter();
-                filter.Add(player);
-            }
+                _viewers.Add(player);
         }
-        if (filter is { Count: > 0 }) SendReveal(filter);
+        if (_viewers.Count == 0) return;
+
+        // The tested build needed per-tick field writes while TAB was held.
+        // Refresh all visible ranks before revealing, including late joiners.
+        var filter = new RecipientFilter();
+        foreach (var viewer in _viewers) filter.Add(viewer);
+        foreach (var player in Utilities.GetPlayers())
+            if (Eligible(player)) ApplyCached(player!);
+        SendReveal(filter);
     }
 
     private static void SendReveal(RecipientFilter filter) =>
