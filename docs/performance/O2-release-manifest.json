@@ -1,0 +1,27 @@
+{
+  "stage": "O2",
+  "date": "2026-11-09",
+  "repository": "koiie111/cs2-ranks",
+  "source_commit": "191212b7a8992209217b66fab59025fe120d1edf",
+  "baseline_commit": "095e7047168d135be2fd97319a08c5e44699f567",
+  "sdk": "10.0.400",
+  "target_framework": "net8.0",
+  "counterstrikesharp_api_package": "1.0.329",
+  "build_command": "dotnet build Ranks/Modules/Ranks_FakeRank/Ranks_FakeRank.csproj -c Release",
+  "test_command": "dotnet run --project Ranks/Modules/Ranks_FakeRank/tests/FakeRankChecks.csproj -c Release",
+  "files": [
+    {
+      "path": "Ranks_FakeRank.dll",
+      "sha256": "efa361a22266124148ed1c980d5666b6c178b437accf704153bb5dc0544afc98",
+      "deploy": true
+    },
+    {
+      "path": "RanksApi.dll",
+      "sha256": "487c16b42ce04a3e17cae7f2d81514b8b858a22b5bcb3dfaf233a0f82f2eae00",
+      "deploy": false,
+      "note": "Build reference only; retain the server's compatible shared API."
+    }
+  ],
+  "tested_instance": "#7 109.195.19.84:27075",
+  "runtime_status": "Original DLL restored after one-client check; active-load comparison pending."
+}
