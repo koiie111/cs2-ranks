@@ -4,7 +4,6 @@ using CounterStrikeSharp.API.Core.Attributes;
 using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Timers;
-using CounterStrikeSharp.API.Modules.UserMessages;
 using CounterStrikeSharp.API.Modules.Utils;
 using RanksApi;
 using Microsoft.Extensions.Logging;
@@ -16,15 +15,13 @@ public class RanksFakeRank : BasePlugin
 {
     public override string ModuleAuthor => "thesamefabius";
     public override string ModuleName => "[Ranks] Fake Rank";
-    public override string ModuleVersion => "v1.0.3-replication.1";
+    public override string ModuleVersion => "v1.0.3-replication.2";
 
     private Config? _config;
     private IRanksApi? _api;
     private int _maxRank;
     private readonly Dictionary<int, AppliedRank> _applied = new();
     private readonly RankReplication _replication = new();
-    private readonly List<CCSPlayerController> _viewers = new();
-    private long _reveals;
     private DateTime _nextErrorLog;
 
     public override void OnAllPluginsLoaded(bool hotReload)
@@ -32,7 +29,7 @@ public class RanksFakeRank : BasePlugin
         TryInitialize();
         AddTimer(0.25f, Reconcile, TimerFlags.REPEAT);
         RegisterListener<Listeners.OnPlayerButtonsChanged>(OnButtonsChanged);
-        RegisterListener<Listeners.OnTick>(RevealWhileHeld);
+        RegisterListener<Listeners.OnTick>(ReconcileWhileHeld);
         RegisterListener<Listeners.OnMapStart>(_ => ClearState());
         RegisterEventHandler<EventPlayerDisconnect>((e, _) =>
         {
@@ -62,7 +59,6 @@ public class RanksFakeRank : BasePlugin
     public override void Unload(bool hotReload)
     {
         if (_api != null) _api.RankChanged -= OnRankChanged;
-        _viewers.Clear();
         ClearState();
     }
 
@@ -132,37 +128,28 @@ public class RanksFakeRank : BasePlugin
             {
                 UpdatePlayer(other!);
             }
-        var filter = new RecipientFilter();
-        filter.Add(player);
-        SendReveal(filter);
+        // Native FakeRanks-RevealAll owns disclosure. Repeated managed reveal
+        // packets cause client-side rank flicker even with stable controller fields.
     }
 
-    private void RevealWhileHeld()
+    private void ReconcileWhileHeld()
     {
         if (_config == null) return;
-        _viewers.Clear();
+        var scoreboardOpen = false;
         foreach (var player in Utilities.GetPlayers())
         {
             if (!Eligible(player)) continue;
             if ((player.Buttons & PlayerButtons.Scoreboard) != 0)
-                _viewers.Add(player);
+            {
+                scoreboardOpen = true;
+                break;
+            }
         }
-        if (_viewers.Count == 0) return;
+        if (!scoreboardOpen) return;
 
-        // Preserve the existing per-tick reveal cadence for the replication A/B.
-        // Fields are written/notified only for a new value or observed live drift.
-        var filter = new RecipientFilter();
-        foreach (var viewer in _viewers) filter.Add(viewer);
+        // Keep visible fields synchronized without re-triggering client disclosure.
         foreach (var player in Utilities.GetPlayers())
             if (Eligible(player)) ApplyCached(player!);
-        SendReveal(filter);
-    }
-
-    private void SendReveal(RecipientFilter filter)
-    {
-        using var message = UserMessage.FromPartialName("CCSUsrMsg_ServerRankRevealAll");
-        message.Send(filter);
-        _reveals++;
     }
 
     private void Apply(CCSPlayerController player, AppliedRank rank, bool force = false)
@@ -195,7 +182,7 @@ public class RanksFakeRank : BasePlugin
             return;
         }
         if (command.ArgCount == 2) slot = int.Parse(command.GetArg(1));
-        command.ReplyToCommand($"[FakeRank] version={ModuleVersion} api={_api != null} config={_config != null} mode={_config?.Type} checks={_replication.Checks} applied={_replication.Applied} skipped={_replication.Skipped} notifications={_replication.Notifications} drift={_replication.DriftRepairs} failures={_replication.Failures} reveals={_reveals}");
+        command.ReplyToCommand($"[FakeRank] version={ModuleVersion} api={_api != null} config={_config != null} mode={_config?.Type} checks={_replication.Checks} applied={_replication.Applied} skipped={_replication.Skipped} notifications={_replication.Notifications} drift={_replication.DriftRepairs} failures={_replication.Failures} reveal=external-metamod");
         command.ReplyToCommand($"[FakeRank] networked wins={Schema.IsSchemaFieldNetworked("CCSPlayerController", "m_iCompetitiveWins")} type={Schema.IsSchemaFieldNetworked("CCSPlayerController", "m_iCompetitiveRankType")} value={Schema.IsSchemaFieldNetworked("CCSPlayerController", "m_iCompetitiveRanking")}");
         foreach (var player in Utilities.GetPlayers())
         {
