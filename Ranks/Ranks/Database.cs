@@ -9,6 +9,7 @@ public class Database
 {
     private readonly Ranks _ranks;
     private readonly string _dbConnectionString;
+    private readonly Dictionary<(string Table, string Steam), TimeSpan> _unsentPlaytime = new();
 
     public Database(Ranks ranks, string connection)
     {
@@ -18,6 +19,11 @@ public class Database
 
     public async Task UpdateUserStatsDb(SteamID steamId, User user, TimeSpan playtime, long lastconnect)
     {
+        var table = _ranks.Config.TableName;
+        var steam = steamId.SteamId2.ReplaceFirstCharacter();
+        var key = (table, steam);
+        if (_unsentPlaytime.Remove(key, out var pending)) playtime += pending;
+        var submitted = false;
         try
         {
             await using var connection = new MySqlConnection(_dbConnectionString);
@@ -25,7 +31,7 @@ public class Database
 
             var updateQuery = $@"
         UPDATE 
-            `{_ranks.Config.TableName}` 
+            `{table}`
         SET 
             `steam` = @SteamId,
             `name` = @Username,
@@ -44,9 +50,10 @@ public class Database
         WHERE 
             `steam` = @SteamId";
 
+            submitted = true;
             await connection.ExecuteAsync(updateQuery, new
             {
-                SteamId = steamId.SteamId2.ReplaceFirstCharacter(),
+                SteamId = steam,
                 Username = user.name,
                 LastLevel = user.rank,
                 Experience = user.value,
@@ -64,6 +71,7 @@ public class Database
         }
         catch (Exception e)
         {
+            if (!submitted) _unsentPlaytime[key] = playtime;
             Console.WriteLine(e);
         }
     }
@@ -137,15 +145,17 @@ public class Database
         }
     }
 
-    public async Task ResetPlayerData(string steamId)
+    internal async Task ResetPlayerData(string steamId, int initialExperience, string table)
     {
+        steamId = steamId.ReplaceFirstCharacter();
+        _unsentPlaytime.Remove((table, steamId));
         try
         {
             await using var dbConnection = new MySqlConnection(_dbConnectionString);
             await dbConnection.OpenAsync();
 
             var resetPlayerQuery = $@"
-                UPDATE {_ranks.Config.TableName}
+                UPDATE `{table}`
                 SET
                     value = @DefaultValue,
                     rank = 0,
@@ -163,8 +173,8 @@ public class Database
 
             await dbConnection.ExecuteAsync(resetPlayerQuery, new
             {
-                SteamId = steamId.ReplaceFirstCharacter(),
-                DefaultValue = _ranks.Config.InitialExperiencePoints,
+                SteamId = steamId,
+                DefaultValue = initialExperience,
                 LastConnect = DateTimeOffset.Now.ToUnixTimeSeconds()
             });
         }

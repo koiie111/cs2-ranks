@@ -15,6 +15,11 @@ public class RanksExStatsHits : BasePlugin
     public override string ModuleVersion => "v1.0.1";
 
     public readonly Dictionary<int, Dictionary<HitData, int>> Hits = new();
+    private readonly Dictionary<int, SteamID> _connections = new();
+    private long _generation;
+    private readonly Dictionary<int, long> _versions = new();
+    private Task _databaseTail = Task.CompletedTask;
+    private bool _unloaded;
     private IRanksApi? _api;
 
     public override void OnAllPluginsLoaded(bool hotReload)
@@ -22,7 +27,7 @@ public class RanksExStatsHits : BasePlugin
         _api = IRanksApi.Capability.Get();
         if (_api == null) return;
 
-        Task.Run(CreateTable);
+        Enqueue(CreateTable);
         
         RegisterListener<Listeners.OnClientAuthorized>(OnAuthorized);
         RegisterListener<Listeners.OnClientDisconnect>(OnDisconnect);
@@ -30,6 +35,24 @@ public class RanksExStatsHits : BasePlugin
         RegisterEventHandler<EventPlayerHurt>(EventPlayerHurt);
         
         _api.CreatedMenu += OnCreatedMenu;
+
+        if (hotReload)
+            foreach (var player in Utilities.GetPlayers())
+                if (!player.IsBot && player.AuthorizedSteamID is { } steamId)
+                    OnAuthorized(player.Slot, steamId);
+    }
+
+    public override void Unload(bool hotReload)
+    {
+        if (_api != null) _api.CreatedMenu -= OnCreatedMenu;
+        foreach (var slot in _connections.Keys.ToArray()) OnDisconnect(slot);
+        _unloaded = true;
+    }
+
+    private void Enqueue(Func<Task> operation)
+    {
+        _databaseTail = _databaseTail.ContinueWith(_ => operation(), CancellationToken.None,
+            TaskContinuationOptions.None, TaskScheduler.Default).Unwrap();
     }
 
     private void OnCreatedMenu(CCSPlayerController player, IMenu menu)
@@ -43,11 +66,9 @@ public class RanksExStatsHits : BasePlugin
         var subMenu = new ChatMenu("");
         subMenu.AddMenuOption("Back", OpenSubMenu);
 
-        var hits = Hits[player.Slot];
-        var allHits = hits[HitData.HdHitAll];
-        
-        if (allHits is not 0)
+        if (Hits.TryGetValue(player.Slot, out var hits) && hits[HitData.HdHitAll] is not 0)
         {
+            var allHits = hits[HitData.HdHitAll];
             var hitTitle = Localizer["hits"];
 
             menu.AddMenuOption(hitTitle, (controller, _) =>
@@ -83,8 +104,6 @@ public class RanksExStatsHits : BasePlugin
                 var health = hits[HitData.HdDmgHealth];
                 var armor = hits[HitData.HdDmgArmor];
 
-                allHits = health + armor;
-            
                 subMenu.AddMenuOption(Localizer["dmg_player",
                     health,
                     armor].Value.Replace('\n', '\u2029'), null!, true);
@@ -102,18 +121,23 @@ public class RanksExStatsHits : BasePlugin
     
     private void OnAuthorized(int slot, SteamID id)
     {
-        Task.Run(() => LoadHitsFromDatabase(slot, id));
+        if (_connections.TryGetValue(slot, out var current) && current.SteamId64 == id.SteamId64) return;
+        OnDisconnect(slot);
+        var generation = ++_generation;
+        _connections[slot] = id;
+        _versions[slot] = generation;
+        Enqueue(() => LoadHitsFromDatabase(slot, generation, id));
     }
 
     private void OnDisconnect(int slot)
     {
-        var player = Utilities.GetPlayerFromSlot(slot);
-        if (player is null || player.IsBot) return;
-
-        var steamId =
-            new SteamID(player.AuthorizedSteamID == null ? player.SteamID : player.AuthorizedSteamID.SteamId64);
-
-        Task.Run(() => SavePlayerData(slot, steamId));
+        _versions.Remove(slot);
+        var hasConnection = _connections.Remove(slot, out var steamId);
+        if (Hits.Remove(slot, out var hits) && hasConnection)
+        {
+            var snapshot = new Dictionary<HitData, int>(hits);
+            Enqueue(() => SavePlayerData(snapshot, steamId!));
+        }
     }
 
     private HookResult EventPlayerHurt(EventPlayerHurt @event, GameEventInfo info)
@@ -128,7 +152,9 @@ public class RanksExStatsHits : BasePlugin
         hits[HitData.HdDmgArmor] += @event.DmgArmor;
 
         hits[HitData.HdHitAll]++;
-        hits[(HitData)@event.Hitgroup]++;
+        var group = (HitData)@event.Hitgroup;
+        if (group != HitData.HdHitAll && hits.TryGetValue(group, out var count))
+            hits[group] = count + 1;
 
         return HookResult.Continue;
     }
@@ -180,7 +206,7 @@ public class RanksExStatsHits : BasePlugin
         }
     }
 
-    private async Task SavePlayerData(int slot, SteamID steamId)
+    private async Task SavePlayerData(Dictionary<HitData, int> hits, SteamID steamId)
     {
         try
         {
@@ -201,7 +227,6 @@ public class RanksExStatsHits : BasePlugin
                     Neak = @Neak
                 WHERE SteamID = @SteamId;";
 
-            var hits = Hits[slot];
             await connection.ExecuteAsync(updateQuery, new
             {
                 DmgHealth = hits[HitData.HdDmgHealth],
@@ -216,8 +241,6 @@ public class RanksExStatsHits : BasePlugin
                 Neak = hits[HitData.HdHitNeak],
                 SteamId = ReplaceFirstCharacter(steamId.SteamId2)
             });
-
-            Hits.Remove(slot);
         }
         catch (Exception e)
         {
@@ -225,7 +248,7 @@ public class RanksExStatsHits : BasePlugin
         }
     }
 
-    private async Task LoadHitsFromDatabase(int slot, SteamID id)
+    private async Task LoadHitsFromDatabase(int slot, long generation, SteamID id)
     {
         try
         {
@@ -237,33 +260,32 @@ public class RanksExStatsHits : BasePlugin
             var query = $"SELECT * FROM `{_api?.DatabaseTableName}_hits` WHERE SteamId = @SteamId;";
             var hitsData = await connection.QueryFirstOrDefaultAsync(query, new { SteamId = steamId });
 
-            Hits.Add(slot, Enum.GetValues(typeof(HitData)).Cast<HitData>().ToDictionary(hit => hit, hit => 0));
+            var hits = Enum.GetValues<HitData>().ToDictionary(hit => hit, _ => 0);
 
             if (hitsData == null)
             {
                 await AddPlayerToDatabase(steamId);
-                return;
+            }
+            else
+            {
+                hits[HitData.HdDmgHealth] = hitsData.DmgHealth;
+                hits[HitData.HdDmgArmor] = hitsData.DmgArmor;
+                hits[HitData.HdHitHead] = hitsData.Head;
+                hits[HitData.HdHitChest] = hitsData.Chest;
+                hits[HitData.HdHitBelly] = hitsData.Belly;
+                hits[HitData.HdHitLeftArm] = hitsData.LeftArm;
+                hits[HitData.HdHitRightArm] = hitsData.RightArm;
+                hits[HitData.HdHitLeftLeg] = hitsData.LeftLeg;
+                hits[HitData.HdHitRightLeg] = hitsData.RightLeg;
+                hits[HitData.HdHitNeak] = hitsData.Neak;
+                hits[HitData.HdHitAll] = hits.Values.Sum();
             }
 
-            Hits[slot] = new Dictionary<HitData, int>
+            Server.NextFrame(() =>
             {
-                [HitData.HdDmgHealth] = hitsData.DmgHealth,
-                [HitData.HdDmgArmor] = hitsData.DmgArmor,
-                [HitData.HdHitHead] = hitsData.Head,
-                [HitData.HdHitChest] = hitsData.Chest,
-                [HitData.HdHitBelly] = hitsData.Belly,
-                [HitData.HdHitLeftArm] = hitsData.LeftArm,
-                [HitData.HdHitRightArm] = hitsData.RightArm,
-                [HitData.HdHitLeftLeg] = hitsData.LeftLeg,
-                [HitData.HdHitRightLeg] = hitsData.RightLeg,
-                [HitData.HdHitNeak] = hitsData.Neak,
-                [HitData.HdHitAll] = 0
-            };
-
-            foreach (var (key, value) in Hits[slot])
-            {
-                Hits[slot][HitData.HdHitAll] += value;
-            }
+                if (!_unloaded && _versions.TryGetValue(slot, out var current) && current == generation)
+                    Hits[slot] = hits;
+            });
         }
         catch (Exception e)
         {

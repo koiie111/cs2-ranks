@@ -16,13 +16,17 @@ public class RanksExStatsGeoIp : BasePlugin
     public override string ModuleVersion => "v1.0.0";
 
     private IRanksApi? _api;
+    private readonly object _readerLock = new();
+    private DatabaseReader? _reader;
+    private bool _unloaded;
+    private Task _tableReady = Task.CompletedTask;
 
     public override void OnAllPluginsLoaded(bool hotReload)
     {
         _api = IRanksApi.Capability.Get();
         if (_api == null) return;
 
-        Task.Run(CreateTable);
+        _tableReady = Task.Run(CreateTable);
         RegisterListener<Listeners.OnClientAuthorized>((slot, id) =>
         {
             var player = Utilities.GetPlayerFromSlot(slot);
@@ -39,6 +43,16 @@ public class RanksExStatsGeoIp : BasePlugin
             
             Task.Run(() => OnClientAuthorizedAsync(steamId, ip.Split(':')[0]));
         });
+    }
+
+    public override void Unload(bool hotReload)
+    {
+        lock (_readerLock)
+        {
+            _unloaded = true;
+            _reader?.Dispose();
+            _reader = null;
+        }
     }
 
     private async Task CreateTable()
@@ -65,9 +79,14 @@ public class RanksExStatsGeoIp : BasePlugin
     {
         try
         {
-            using var reader = new DatabaseReader(Path.Combine(ModuleDirectory, "GeoLite2-City.mmdb"));
-
-            var response = reader.City(IPAddress.Parse(ip));
+            await _tableReady;
+            MaxMind.GeoIP2.Responses.CityResponse response;
+            lock (_readerLock)
+            {
+                if (_unloaded) return;
+                _reader ??= new DatabaseReader(Path.Combine(ModuleDirectory, "GeoLite2-City.mmdb"));
+                response = _reader.City(IPAddress.Parse(ip));
+            }
 
             var countryName = response.Country.Name ?? string.Empty;
             var cityName = response.City.Name ?? string.Empty;

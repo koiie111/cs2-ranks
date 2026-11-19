@@ -14,6 +14,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Remove="tests\**\*.cs" />
     <ProjectReference Include="..\RanksApi\RanksApi.csproj" />
   </ItemGroup>
 
