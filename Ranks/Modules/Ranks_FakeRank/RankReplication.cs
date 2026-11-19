@@ -14,7 +14,7 @@ internal enum RankFields { None = 0, Wins = 1, Type = 2, Value = 4, All = Wins |
 internal interface ICompetitiveRankFields
 {
     RankValues Read();
-    void Write(RankValues values);
+    void Write(RankValues values, RankFields dirty);
     void Notify(RankFields field);
 }
 
@@ -42,12 +42,13 @@ internal sealed class RankReplication
                 return false;
             }
 
+            var dirty = Difference(live, desired.Values);
             var changed = RankFields.All;
             if (!force && notified is { } previous && previous.Identity == desired.Identity)
-                changed = Difference(live, desired.Values) | Difference(previous.Values, desired.Values);
+                changed = dirty | Difference(previous.Values, desired.Values);
 
-            // Write the complete triple before making any part eligible for a snapshot.
-            fields.Write(desired.Values);
+            // Make the whole triple coherent before the first notification.
+            if (dirty != RankFields.None) fields.Write(desired.Values, dirty);
             Notify(RankFields.Wins);
             Notify(RankFields.Type);
             Notify(RankFields.Value);

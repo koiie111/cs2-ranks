@@ -26,6 +26,17 @@ Check(!RankProjection.TryProject(1, 3, ranks, max, out _), "missing rank mapping
 Check(!RankProjection.TryProject(1, 1, new Dictionary<int, int>(), 1, out _), "empty rank mapping withheld");
 
 // Offsets come from the server schema. Exercise discontiguous fields and their exact widths.
+new RankFieldLayout(4, 8, 9).Validate(13); // Adjacent fields, last byte at the class boundary.
+foreach (var invalid in new[] {
+    new RankFieldLayout(0, 8, 12), new RankFieldLayout(4, 16, 12),
+    new RankFieldLayout(4, 8, 13), new RankFieldLayout(4, 8, 3),
+    new RankFieldLayout(4, 6, 12), new RankFieldLayout(4, 15, 12) })
+{
+    var rejected = false;
+    try { invalid.Validate(16); }
+    catch (InvalidOperationException) { rejected = true; }
+    Check(rejected, $"invalid schema {invalid}");
+}
 var address = Marshal.AllocHGlobal(32);
 try
 {
@@ -38,6 +49,16 @@ finally { Marshal.FreeHGlobal(address); }
 
 var connection = new PlayerIdentity(76561198000000001, 1, 0x1001);
 var desired = new AppliedRank(connection, new RankValues(111, 11, 12345));
+var participant = new RanksFakeRank.Participant();
+Check(participant.ShouldRefresh(false), "first tick can initialize a new connection");
+Check(participant.ShouldRefresh(true), "full poll probes a pending connection");
+for (var tick = 0; tick < 64; tick++)
+    Check(!participant.ShouldRefresh(false), "unavailable data waits for the next poll");
+Check(participant.ShouldRefresh(true), "timer or TAB retries an unavailable rank");
+participant.Desired = desired;
+Check(participant.ShouldRefresh(false), "known rank is checked even with TAB closed");
+participant.OnAuthorized();
+Check(participant.Desired == null && participant.ShouldRefresh(false), "authorization reopens immediate discovery");
 var state = new RankReplication();
 AppliedRank? notified = null;
 var fields = new FakeFields();
@@ -55,6 +76,7 @@ for (var mask = 1; mask < 8; mask++)
     fields.Notified.Clear();
     Check(state.Apply(ref notified, desired, fields), "engine drift repaired");
     Check(fields.Live == desired.Values, "drift restored full triple");
+    Check(fields.LastWritten == (RankFields)mask, "only drifted fields written");
     Check(fields.Notified.Aggregate(RankFields.None, (a, b) => a | b) == (RankFields)mask, "only drifted fields notified");
 }
 Check(state.DriftRepairs == 7, "drift counter");
@@ -67,7 +89,9 @@ Check(fields.Notified.SequenceEqual(new[] { RankFields.Value }), "XP change noti
 // still differs, so a matching read must not suppress the network notification.
 fields.Live = desired.Values;
 fields.Notified.Clear();
+var writesBeforeNotify = fields.Writes;
 Check(state.Apply(ref notified, desired, fields) && fields.Notified.SequenceEqual(new[] { RankFields.Value }), "desired change requires notify even if live matches");
+Check(fields.Writes == writesBeforeNotify, "matching live fields are not rewritten");
 
 foreach (var identity in new[]
 {
@@ -121,7 +145,16 @@ foreach (var failure in new[] { RankFields.Wins, RankFields.Type, RankFields.Val
         Check(failedState.Apply(ref failedNotification, desired, failingFields) && failingFields.Notified.Count == 3, "failed drift/spawn retried on next normal tick");
     }
 }
-Console.WriteLine("FakeRank projection, 640 steady ticks, drift combinations, lifecycle, multi-player isolation and failure-retry checks passed");
+fields.Live = default;
+fields.FailAfterWins = true;
+try { state.Apply(ref notified, desired, fields); }
+catch (InvalidOperationException) { }
+Check(notified == null && fields.Live == new RankValues(111, 0, 0), "partial field write invalidates success");
+fields.FailAfterWins = false;
+fields.Notified.Clear();
+Check(state.Apply(ref notified, desired, fields) && fields.Live == desired.Values, "remaining fields repaired on retry");
+Check(fields.LastWritten == (RankFields.Type | RankFields.Value) && fields.Notified.Count == 3, "partial write retries full notification");
+Console.WriteLine("FakeRank schema, projection, polling, steady ticks, drift, lifecycle and replication retry checks passed");
 
 static void Check(bool success, string name)
 {
@@ -132,10 +165,20 @@ sealed class FakeFields : ICompetitiveRankFields
 {
     public RankValues Live;
     public int Writes;
+    public RankFields LastWritten;
+    public bool FailAfterWins;
     public RankFields FailOn;
     public readonly List<RankFields> Notified = new();
     public RankValues Read() => Live;
-    public void Write(RankValues values) { Live = values; Writes++; }
+    public void Write(RankValues values, RankFields dirty)
+    {
+        LastWritten = dirty;
+        if ((dirty & RankFields.Wins) != 0) Live = Live with { Wins = values.Wins };
+        if (FailAfterWins) throw new InvalidOperationException("simulated partial write");
+        if ((dirty & RankFields.Type) != 0) Live = Live with { Type = values.Type };
+        if ((dirty & RankFields.Value) != 0) Live = Live with { Value = values.Value };
+        Writes++;
+    }
     public void Notify(RankFields field)
     {
         if (field == FailOn) throw new InvalidOperationException("simulated notify failure");

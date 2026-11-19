@@ -15,13 +15,28 @@ public class RanksFakeRank : BasePlugin
 {
     public override string ModuleAuthor => "thesamefabius";
     public override string ModuleName => "[Ranks] Fake Rank";
-    public override string ModuleVersion => "v1.0.4";
+    public override string ModuleVersion => "v1.0.4.1";
 
-    private sealed class Participant
+    internal sealed class Participant
     {
         public CCSPlayerController? Player;
         public AppliedRank? Desired;
         public AppliedRank? Notified;
+        // New connections can initialize on their first ready tick. After a full
+        // poll finds no data, the timer, TAB and lifecycle events own retries.
+        private bool _hasPolled;
+
+        public bool ShouldRefresh(bool fullPoll)
+        {
+            if (fullPoll) _hasPolled = true;
+            return Desired.HasValue || fullPoll || !_hasPolled;
+        }
+
+        public void OnAuthorized()
+        {
+            Desired = null;
+            _hasPolled = false;
+        }
     }
 
     private Config? _config;
@@ -31,6 +46,8 @@ public class RanksFakeRank : BasePlugin
     private bool _discoverPlayers = true;
     private RankFieldLayout? _layout;
     private DateTime _nextLayoutAttempt;
+    private DateTime _nextConfigAttempt;
+    private int? _lastTabTick;
     private bool _guidelinesBlocked;
     private readonly RankReplication _replication = new();
     private DateTime _nextErrorLog;
@@ -45,11 +62,16 @@ public class RanksFakeRank : BasePlugin
         RegisterListener<Listeners.OnClientPutInServer>(slot =>
         {
             _participants[slot] = new Participant();
+            _lastTabTick = null;
         });
         RegisterListener<Listeners.OnClientDisconnect>(slot => _participants.Remove(slot));
         RegisterListener<Listeners.OnClientAuthorized>((slot, _) =>
         {
-            if (_participants.TryGetValue(slot, out var participant)) participant.Desired = null;
+            if (_participants.TryGetValue(slot, out var participant))
+            {
+                participant.OnAuthorized();
+                _lastTabTick = null;
+            }
         });
         RegisterEventHandler<EventPlayerSpawn>((e, _) =>
         {
@@ -58,9 +80,10 @@ public class RanksFakeRank : BasePlugin
         });
         AddCommand("css_fakerank_reload", "", (player, _) =>
         {
-            if (player != null || _api == null) return;
-            _config = _api.LoadConfig<Config>("ranks_fakerank");
-            _maxRank = RankProjection.MaxRank(_config.FakeRank);
+            if (player != null) return;
+            _nextConfigAttempt = default;
+            var loaded = _api == null ? TryInitialize() : TryLoadConfig(_api);
+            if (!loaded) return;
             ClearState();
             PollRanks();
         });
@@ -80,11 +103,31 @@ public class RanksFakeRank : BasePlugin
         try { api = IRanksApi.Capability.Get(); }
         catch (KeyNotFoundException) { return false; }
         if (api == null) return false;
-        _config = api.LoadConfig<Config>("ranks_fakerank");
+        if (DateTime.UtcNow < _nextConfigAttempt || !TryLoadConfig(api)) return false;
         _api = api;
-        _maxRank = RankProjection.MaxRank(_config.FakeRank);
         _api.RankChanged += OnRankChanged;
         return true;
+    }
+
+    private bool TryLoadConfig(IRanksApi api)
+    {
+        try
+        {
+            var config = api.LoadConfig<Config>("ranks_fakerank");
+            if (config.FakeRank is null && config.Type != 0)
+                throw new InvalidDataException("FakeRank mapping is required in rank mode");
+            config.FakeRank ??= new();
+            var maxRank = RankProjection.MaxRank(config.FakeRank);
+            _config = config;
+            _maxRank = maxRank;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _nextConfigAttempt = DateTime.UtcNow.AddSeconds(10);
+            Logger.LogError(ex, "Could not load ranks_fakerank configuration");
+            return false;
+        }
     }
 
     private static bool Eligible(CCSPlayerController? player) =>
@@ -112,7 +155,11 @@ public class RanksFakeRank : BasePlugin
 
     private void OnButtonsChanged(CCSPlayerController player, PlayerButtons pressed, PlayerButtons released)
     {
-        if ((pressed & PlayerButtons.Scoreboard) != 0 && Eligible(player)) PollRanks();
+        if ((pressed & PlayerButtons.Scoreboard) == 0) return;
+        var tick = Server.TickCount;
+        if (_lastTabTick == tick || !Eligible(player) || !TryInitialize()) return;
+        RefreshPlayers(poll: true);
+        _lastTabTick = tick;
     }
 
     private void RefreshPlayers(bool poll)
@@ -133,12 +180,14 @@ public class RanksFakeRank : BasePlugin
 
         foreach (var (slot, participant) in _participants)
         {
+            if (!participant.ShouldRefresh(poll)) continue;
             var player = participant.Player;
             // Handle resolves CSS's index + serial. Never retain its address across callbacks.
             var address = player?.Handle ?? 0;
             if (address == 0)
             {
                 participant.Desired = null;
+                participant.Notified = null;
                 player = participant.Player = Utilities.GetPlayerFromSlot(slot);
                 address = player?.Handle ?? 0;
                 if (address == 0) continue; // PutInServer may precede controller creation.
@@ -230,6 +279,7 @@ public class RanksFakeRank : BasePlugin
     {
         _participants.Clear();
         _discoverPlayers = true;
+        _lastTabTick = null;
         _layout = null;
         _nextLayoutAttempt = default;
     }
@@ -268,11 +318,11 @@ public class RanksFakeRank : BasePlugin
     private readonly struct ControllerRankFields(CCSPlayerController player, nint address, RankFieldLayout layout) : ICompetitiveRankFields
     {
         public RankValues Read() => layout.Read(address);
-        public void Write(RankValues values)
+        public void Write(RankValues values, RankFields dirty)
         {
-            player.CompetitiveWins = values.Wins;
-            player.CompetitiveRankType = values.Type;
-            player.CompetitiveRanking = values.Value;
+            if ((dirty & RankFields.Wins) != 0) player.CompetitiveWins = values.Wins;
+            if ((dirty & RankFields.Type) != 0) player.CompetitiveRankType = values.Type;
+            if ((dirty & RankFields.Value) != 0) player.CompetitiveRanking = values.Value;
         }
         public void Notify(RankFields field) => Utilities.SetStateChanged(player, "CCSPlayerController", field switch
         {
