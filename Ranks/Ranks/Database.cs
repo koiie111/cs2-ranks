@@ -1,4 +1,3 @@
-using System.Reflection.Metadata;
 using CounterStrikeSharp.API.Modules.Entities;
 using Dapper;
 using MySqlConnector;
@@ -21,11 +20,12 @@ public class Database
     public Task UpdateUserStatsDb(SteamID steamId, User user, TimeSpan playtime, long lastconnect) =>
         UpdateUserStatsDb(steamId, user, playtime, lastconnect, _ranks.Config.TableName);
 
-    internal async Task UpdateUserStatsDb(SteamID steamId, User user, TimeSpan playtime, long lastconnect, string table)
+    internal async Task<bool> UpdateUserStatsDb(SteamID steamId, User user, TimeSpan playtime, long lastconnect,
+        string table, bool replacePlaytime = false)
     {
         var steam = steamId.SteamId2.ReplaceFirstCharacter();
         var key = (table, steam);
-        if (_unsentPlaytime.TryRemove(key, out var pending)) playtime += pending;
+        if (_unsentPlaytime.TryRemove(key, out var pending) && !replacePlaytime) playtime += pending;
         var submitted = false;
         try
         {
@@ -48,13 +48,13 @@ public class Database
             `assists` = @Assists,
             `round_win` = @Roundwin,
             `round_lose` = @Roundlose,
-            `playtime` = `playtime` + @PlayTime,
+            `playtime` = {(replacePlaytime ? "@PlayTime" : "`playtime` + @PlayTime")},
             `lastconnect` = @LastConnect
         WHERE 
             `steam` = @SteamId";
 
             submitted = true;
-            await connection.ExecuteAsync(updateQuery, new
+            var matched = await connection.ExecuteAsync(updateQuery, new
             {
                 SteamId = steam,
                 Username = user.name,
@@ -71,11 +71,15 @@ public class Database
                 PlayTime = playtime.TotalSeconds,
                 LastConnect = lastconnect
             });
+            if (matched == 0)
+                throw new InvalidOperationException($"No stats row matched {steam} in {table}");
+            return true;
         }
         catch (Exception e)
         {
-            if (!submitted) _unsentPlaytime[key] = playtime;
+            if (!submitted && !replacePlaytime) _unsentPlaytime[key] = playtime;
             Console.WriteLine(e);
+            return false;
         }
     }
 
@@ -86,20 +90,12 @@ public class Database
             await using var connection = new MySqlConnection(_dbConnectionString);
             await connection.OpenAsync();
 
-            var rankQuery =
-                $"SELECT COUNT(*) + 1 AS PlayerRank FROM {_ranks.Config.TableName} WHERE value > (SELECT value FROM {_ranks.Config.TableName} WHERE steam = @SteamId);";
-
-            var totalPlayersQuery = $"SELECT COUNT(*) AS TotalPlayers FROM {_ranks.Config.TableName};";
-
-            var playerRank =
-                await connection.QueryFirstOrDefaultAsync<int>(rankQuery,
-                    new
-                    {
-                        SteamId = steamId.ReplaceFirstCharacter(),
-                    });
-            var totalPlayers = await connection.QueryFirstOrDefaultAsync<int>(totalPlayersQuery);
-
-            return new PlayerStats { PlayerRank = playerRank, TotalPlayers = totalPlayers };
+            var table = _ranks.Config.TableName;
+            return await connection.QuerySingleAsync<PlayerStats>($"""
+                SELECT (SELECT COUNT(*) + 1 FROM `{table}`
+                        WHERE value > (SELECT value FROM `{table}` WHERE steam = @SteamId LIMIT 1)) AS PlayerRank,
+                       (SELECT COUNT(*) FROM `{table}`) AS TotalPlayers
+                """, new { SteamId = steamId.ReplaceFirstCharacter() });
         }
         catch (Exception e)
         {
@@ -116,37 +112,38 @@ public class Database
             await using var connection = new MySqlConnection(_dbConnectionString);
             await connection.OpenAsync();
 
-            var parameters = new User
-            {
-                steam = steamId.ReplaceFirstCharacter(),
-                name = playerName,
-                value = _ranks.Config.InitialExperiencePoints,
-                rank = 0,
-                kills = 0,
-                deaths = 0,
-                shoots = 0,
-                hits = 0,
-                headshots = 0,
-                assists = 0,
-                round_win = 0,
-                round_lose = 0,
-                playtime = 0,
-                lastconnect = 0,
-            };
-
-            var query = $@"
-                INSERT INTO `{_ranks.Config.TableName}` 
-                (`steam`, `name`, `value`, `rank`, `kills`, `deaths`, `shoots`, `hits`, `headshots`, `assists`, `round_win`, `round_lose`, `playtime`, `lastconnect`) 
-                VALUES 
-                (@steam, @name, @value, @rank, @kills, @deaths, @shoots, @hits, @headshots, @assists, @round_win, @round_lose, @playtime, @lastconnect);";
-
-            await connection.ExecuteAsync(query, parameters);
+            await InsertUser(connection, _ranks.Config.TableName, playerName, steamId.ReplaceFirstCharacter(),
+                _ranks.Config.InitialExperiencePoints);
         }
         catch (Exception e)
         {
             Console.WriteLine(e);
         }
     }
+
+    private static Task InsertUser(MySqlConnection connection, string table, string name, string steam, int value) =>
+        connection.ExecuteAsync($"""
+            INSERT INTO `{table}` (steam, name, value, `rank`, kills, deaths, shoots, hits, headshots, assists,
+                                   round_win, round_lose, playtime, lastconnect)
+            VALUES (@steam, @name, @value, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            ON DUPLICATE KEY UPDATE steam = steam
+            """, new { steam, name, value });
+
+    internal async Task<User> LoadOrCreateUser(string table, string playerName, string steamId, int initialExperience)
+    {
+        var steam = steamId.ReplaceFirstCharacter();
+        await using var connection = new MySqlConnection(_dbConnectionString);
+        await connection.OpenAsync();
+        var select = $"SELECT * FROM `{table}` WHERE steam = @steam LIMIT 1";
+        var existing = await connection.QueryFirstOrDefaultAsync<User>(select, new { steam });
+        if (existing != null) return existing;
+
+        await InsertUser(connection, table, playerName, steam, initialExperience);
+        return await connection.QuerySingleAsync<User>(select, new { steam });
+    }
+
+    public Task ResetPlayerData(string steamId) =>
+        ResetPlayerData(steamId, _ranks.Config.InitialExperiencePoints, _ranks.Config.TableName);
 
     internal async Task ResetPlayerData(string steamId, int initialExperience, string table)
     {
@@ -192,7 +189,7 @@ public class Database
         try
         {
             await using var dbConnection = new MySqlConnection(_dbConnectionString);
-            dbConnection.Open();
+            await dbConnection.OpenAsync();
 
             var createLrTable = $@"
             CREATE TABLE IF NOT EXISTS `{_ranks.Config.TableName}` (
@@ -209,7 +206,9 @@ public class Database
                 `round_win` BIGINT NOT NULL,
                 `round_lose` BIGINT NOT NULL,
                 `playtime` BIGINT NOT NULL,
-                `lastconnect` BIGINT NOT NULL
+                `lastconnect` BIGINT NOT NULL,
+                PRIMARY KEY (`steam`),
+                KEY idx_ranks_value (`value`)
             );";
 
             await dbConnection.ExecuteAsync(createLrTable);

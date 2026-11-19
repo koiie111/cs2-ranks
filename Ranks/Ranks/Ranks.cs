@@ -42,10 +42,22 @@ public class Ranks : BasePlugin
     private Task _tableReady = Task.CompletedTask;
     private bool _unloaded;
 
-    private sealed class Session(SteamID steamId)
+    // Only the ordered database lane reads or clears Pending after the request is enqueued.
+    internal sealed class ResetNotice(PlayerIdentity player)
+    {
+        public PlayerIdentity Player { get; } = player;
+        public bool Pending { get; set; } = true;
+    }
+
+    internal sealed class Session(SteamID steamId, ResetNotice? reset = null)
     {
         public SteamID SteamId { get; } = steamId;
-        public long SavedAt { get; set; } = Stopwatch.GetTimestamp();
+        public ResetNotice? Reset { get; } = reset;
+        public long StartedAt { get; } = Stopwatch.GetTimestamp();
+        public long SavedSeconds { get; set; }
+
+        public long ElapsedSeconds(long now) =>
+            Stopwatch.GetElapsedTime(StartedAt, now).Ticks / TimeSpan.TicksPerSecond;
     }
     private RankThresholds _thresholds = null!;
     private CHandle<CCSGameRulesProxy>? _rulesProxy;
@@ -62,7 +74,7 @@ public class Ranks : BasePlugin
 
         Config = LoadConfig();
         _thresholds = new RankThresholds(Config.Ranks);
-        DbConnectionString = BuildConnectionString();
+        DbConnectionString = BuildConnectionString(Config.Connection);
         Database = new Database(this, DbConnectionString);
         var previous = AppDomain.CurrentDomain.GetData(DatabaseHandoffKey) as Dictionary<ulong, Task>;
         AppDomain.CurrentDomain.SetData(DatabaseHandoffKey, null);
@@ -119,6 +131,8 @@ public class Ranks : BasePlugin
         if (!Users.TryGetValue(steamId.SteamId64, out var user)) return;
         var identity = CapturePlayer(controller);
         var snapshot = user.Snapshot();
+        if (_sessions.TryGetValue(controller.Slot, out var session) && session.SteamId.SteamId64 == steamId.SteamId64)
+            snapshot.playtime += session.ElapsedSeconds(Stopwatch.GetTimestamp());
         _ = Task.Run(() => GetUserStats(identity, steamId, snapshot));
     }
 
@@ -171,7 +185,13 @@ public class Ranks : BasePlugin
     {
         if (controller != null) return;
 
-        Config = LoadConfig();
+        var next = LoadConfig();
+        if (next.TableName != Config.TableName || BuildConnectionString(next.Connection) != DbConnectionString)
+        {
+            Logger.LogWarning("Reload the Ranks plugins to switch database or table. Active sessions still use {Table}", Config.TableName);
+            return;
+        }
+        Config = next;
         _thresholds = new RankThresholds(Config.Ranks);
         Logger.LogInformation("Configuration successfully rebooted");
     }
@@ -244,6 +264,12 @@ public class Ranks : BasePlugin
         if (_sessions.TryGetValue(slot, out var existing) && existing.SteamId.SteamId64 == id.SteamId64)
             return;
         FinishSession(slot);
+        foreach (var (oldSlot, oldSession) in _sessions)
+        {
+            if (oldSession.SteamId.SteamId64 != id.SteamId64) continue;
+            FinishSession(oldSlot);
+            break;
+        }
         var session = new Session(id);
         _sessions[slot] = session;
         _databaseWork!.Run(id.SteamId64, () => LoadSession(slot, playerName, session));
@@ -253,14 +279,27 @@ public class Ranks : BasePlugin
     {
         await _tableReady.ConfigureAwait(false);
         var steamId = session.SteamId;
-        var userExists = await Database.UserExists(steamId.SteamId2);
-
-        if (!userExists)
-            await Database.AddUserToDb(playerName, steamId.SteamId2);
-
-        var user = await Database.GetUserStatsFromDb(steamId.SteamId2);
-
-        if (user == null) return;
+        User user;
+        try
+        {
+            user = await Database.LoadOrCreateUser(Config.TableName, playerName, steamId.SteamId2,
+                Config.InitialExperiencePoints);
+        }
+        catch (Exception error)
+        {
+            if (error is MySqlException { Number: 1146 }) await Database.CreateTable();
+            Logger.LogError(error, "Could not load statistics for {SteamId}. Retrying in 30 seconds", steamId.SteamId64);
+            Server.NextFrame(() =>
+            {
+                if (_unloaded) return;
+                AddTimer(30f, () =>
+                {
+                    if (!_unloaded && _sessions.TryGetValue(slot, out var current) && current == session)
+                        _databaseWork!.Run(steamId.SteamId64, () => LoadSession(slot, playerName, session));
+                });
+            });
+            return;
+        }
 
         Server.NextFrame(() =>
         {
@@ -285,24 +324,38 @@ public class Ranks : BasePlugin
         }
     }
 
-    private readonly record struct SaveRequest(SteamID SteamId, User Snapshot, TimeSpan Playtime, long LastConnect,
-        string Table);
+    internal readonly record struct SaveRequest(SteamID SteamId, User Snapshot, TimeSpan Playtime, long LastConnect,
+        string Table, ResetNotice? Reset, long SessionSeconds);
 
-    private static SaveRequest CaptureSave(Session session, User user, long now, long lastConnect, string table)
+    internal static SaveRequest CaptureSave(Session session, User user, long now, long lastConnect, string table)
     {
-        var elapsed = Stopwatch.GetElapsedTime(session.SavedAt, now);
-        session.SavedAt = now;
-        return new SaveRequest(session.SteamId, user.Snapshot(), elapsed, lastConnect, table);
+        var seconds = session.ElapsedSeconds(now);
+        var elapsed = TimeSpan.FromSeconds(seconds - session.SavedSeconds);
+        session.SavedSeconds = seconds;
+        return new SaveRequest(session.SteamId, user.Snapshot(), elapsed, lastConnect, table, session.Reset, seconds);
     }
 
-    private static SaveRequest? CombineSaves(SaveRequest older, SaveRequest newer) =>
-        older.Table == newer.Table ? newer with { Playtime = older.Playtime + newer.Playtime } : null;
+    internal static SaveRequest? CombineSaves(SaveRequest older, SaveRequest newer) =>
+        older.Table == newer.Table && older.Reset == newer.Reset
+            ? newer with { Playtime = older.Playtime + newer.Playtime }
+            : null;
 
     private async Task Save(SaveRequest save)
     {
         await _tableReady.ConfigureAwait(false);
-        await Database.UpdateUserStatsDb(save.SteamId, save.Snapshot, save.Playtime, save.LastConnect, save.Table)
-            .ConfigureAwait(false);
+        var pending = save.Reset is { Pending: true };
+        var playtime = pending ? TimeSpan.FromSeconds(save.SessionSeconds) : save.Playtime;
+        var saved = await Database.UpdateUserStatsDb(save.SteamId, save.Snapshot, playtime, save.LastConnect,
+            save.Table, replacePlaytime: pending).ConfigureAwait(false);
+        if (saved && pending && save.Reset is { } reset)
+        {
+            reset.Pending = false;
+            Server.NextFrame(() =>
+            {
+                if (!_unloaded && ResolvePlayer(reset.Player) is { } current)
+                    PrintToChat(current, Localizer["menu.reset.complete"]);
+            });
+        }
     }
 
     private HookResult EventWeaponFire(EventWeaponFire @event, GameEventInfo info)
@@ -328,7 +381,7 @@ public class Ranks : BasePlugin
         return HookResult.Continue;
     }
     
-     private HookResult EventPlayerDeath(EventPlayerDeath @event, GameEventInfo info)
+    private HookResult EventPlayerDeath(EventPlayerDeath @event, GameEventInfo info)
     {
         if (!RanksEnable.Value || !PopulationAllowsStats() || !IsLiveGame()) return HookResult.Continue;
 
@@ -463,17 +516,17 @@ public class Ranks : BasePlugin
 
         var configEvent = Config.Events.EventRoundEnd;
 
-        if (!RanksEnable.Value || !PopulationAllowsStats() || !IsLiveGame()) return HookResult.Continue;
+        if (!RanksEnable.Value || !IsLiveGame()) return HookResult.Continue;
+        var players = Utilities.GetPlayers();
+        if (Config.MinPlayers > 0 && CountPlayers(players) < Config.MinPlayers) return HookResult.Continue;
 
-        foreach (var player in Utilities.GetPlayers().Where(u => u is { IsValid: true, IsBot: false }))
+        foreach (var player in players)
         {
-            if (player.Team is not CsTeam.Spectator)
-            {
-                if (player.TeamNum != winner)
-                    UpdateUserStatsLocal(player, "LosingRound", exp: configEvent.Loser, roundlose: 1);
-                else
-                    UpdateUserStatsLocal(player, "WinningRound", exp: configEvent.Winner, roundwin: 1);
-            }
+            if (player is not { IsValid: true, IsBot: false } || GetStatsUser(player) is not { } user) continue;
+            if (player.TeamNum == winner)
+                ApplyStats(player, user, "WinningRound", exp: configEvent.Winner, roundwin: 1);
+            else
+                ApplyStats(player, user, "LosingRound", exp: configEvent.Loser, roundlose: 1);
         }
 
         return HookResult.Continue;
@@ -581,15 +634,17 @@ public class Ranks : BasePlugin
         var steamId2 = session.SteamId.SteamId2;
         var initialExperience = Config.InitialExperiencePoints;
         var table = Config.TableName;
-        _databaseWork!.Run(session.SteamId.SteamId64, () => Database.ResetPlayerData(steamId2, initialExperience, table));
-        Users[player.SteamID] = new User
+        var fresh = new Session(session.SteamId, new ResetNotice(CapturePlayer(player)));
+        _sessions[player.Slot] = fresh;
+        var user = new User
         {
             steam = steamId2.ReplaceFirstCharacter(),
             name = player.PlayerName,
             value = initialExperience
         };
-        session.SavedAt = Stopwatch.GetTimestamp();
-        PrintToChat(player, Localizer["menu.reset.complete"]);
+        Users[player.SteamID] = user;
+        _databaseWork!.Save(player.SteamID, CaptureSave(fresh, user, fresh.StartedAt,
+            DateTimeOffset.UtcNow.ToUnixTimeSeconds(), table));
     }
 
     private void UpdateUserStatsLocal(CCSPlayerController? player, string? messageKey = null,
@@ -648,14 +703,18 @@ public class Ranks : BasePlugin
             var msg = messageKey == null ? string.Empty : messageArgument == null
                 ? Localizer[messageKey].Value
                 : Localizer[messageKey, messageArgument].Value;
-            var identity = CapturePlayer(player);
-            Server.NextFrame(() =>
-            {
-                if (!_unloaded && ResolvePlayer(identity) is { } current)
-                    PrintToChat(current,
-                        $"{(exp > 0 ? "\x0C+" : "\x02")}{exp} XP \x08{msg} {(nextXp == 0 ? string.Empty : $"{Localizer["next_level", nextXp]}")}");
-            });
+            QueueExperienceMessage(CapturePlayer(player), exp, msg, nextXp);
         }
+    }
+
+    private void QueueExperienceMessage(PlayerIdentity identity, int exp, string msg, long nextXp)
+    {
+        Server.NextFrame(() =>
+        {
+            if (!_unloaded && ResolvePlayer(identity) is { } current)
+                PrintToChat(current,
+                    $"{(exp > 0 ? "\x0C+" : "\x02")}{exp} XP \x08{msg} {(nextXp == 0 ? string.Empty : $"{Localizer["next_level", nextXp]}")}");
+        });
     }
 
     public (string Name, int Level) GetLevelFromExperience(long experience)
@@ -705,11 +764,8 @@ public class Ranks : BasePlugin
         });
     }
 
-    private string BuildConnectionString()
+    private static string BuildConnectionString(RankDb dbConfig)
     {
-        var dbConfig = Config.Connection;
-
-        Console.WriteLine("Building connection string");
         var builder = new MySqlConnectionStringBuilder
         {
             Database = dbConfig.Database,
@@ -719,7 +775,6 @@ public class Ranks : BasePlugin
             Port = (uint)dbConfig.Port
         };
 
-        Console.WriteLine("OK!");
         return builder.ConnectionString;
     }
 
@@ -861,27 +916,26 @@ public class Ranks : BasePlugin
         return proxy.GameRules is { WarmupPeriod: false };
     }
 
-    private int PlayersCount
+    private int PlayersCount => CountPlayers();
+
+    private int CountPlayers(List<CCSPlayerController>? players = null)
     {
-        get
+        var tick = Server.TickCount;
+        if (_populationTick == tick) return _population;
+
+        var count = 0;
+        foreach (var player in players ?? Utilities.GetPlayers())
         {
-            var tick = Server.TickCount;
-            if (_populationTick == tick) return _population;
-
-            var count = 0;
-            foreach (var player in Utilities.GetPlayers())
-            {
-                if (player is { IsBot: false, IsValid: true, TeamNum: not (0 or 1), PlayerPawn.Value.IsValid: true })
-                    count++;
-            }
-
-            _population = count;
-            _populationTick = tick;
-            return count;
+            if (player is { IsBot: false, IsValid: true, TeamNum: not (0 or 1), PlayerPawn.Value.IsValid: true })
+                count++;
         }
+
+        _population = count;
+        _populationTick = tick;
+        return count;
     }
 
-    private readonly record struct PlayerIdentity(ulong SteamId, int? UserId, uint Handle);
+    internal readonly record struct PlayerIdentity(ulong SteamId, int? UserId, uint Handle);
 
     private static PlayerIdentity CapturePlayer(CCSPlayerController player) =>
         new(player.SteamID, player.UserId, player.EntityHandle.Raw);

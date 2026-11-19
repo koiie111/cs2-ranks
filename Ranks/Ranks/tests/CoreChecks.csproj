@@ -6,8 +6,8 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="../RankThresholds.cs" Link="RankThresholds.cs" />
-    <Compile Include="../PlayerDatabaseQueue.cs" Link="PlayerDatabaseQueue.cs" />
+    <Compile Include="../../Modules/Ranks_ExStats_Hits/HitData.cs" Link="HitData.cs" />
+    <Compile Include="../../Modules/Ranks_ExStats_Hits/HitStatisticsStore.cs" Link="HitStatisticsStore.cs" />
     <ProjectReference Include="../Ranks.csproj" />
   </ItemGroup>
 </Project>

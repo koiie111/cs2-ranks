@@ -6,6 +6,9 @@ internal sealed class PlayerDatabaseQueue<TSave>(
     Action<Exception> report,
     IReadOnlyDictionary<ulong, Task>? previous = null) where TSave : struct
 {
+    // Leave pool capacity for logins and commands during an autosave or mass disconnect.
+    internal const int MaxConcurrentWrites = 4;
+    private readonly SemaphoreSlim _writers = new(MaxConcurrentWrites);
     private readonly object _gate = new();
     private readonly Dictionary<ulong, Lane> _lanes = new();
     private readonly Dictionary<ulong, Task> _previous = previous == null ? new() : new(previous);
@@ -67,7 +70,12 @@ internal sealed class PlayerDatabaseQueue<TSave>(
             try
             {
                 if (work.Operation is { } operation) await operation().ConfigureAwait(false);
-                else if (work.Save is { } snapshot) await write(snapshot).ConfigureAwait(false);
+                else if (work.Save is { } snapshot)
+                {
+                    await _writers.WaitAsync().ConfigureAwait(false);
+                    try { await write(snapshot).ConfigureAwait(false); }
+                    finally { _writers.Release(); }
+                }
             }
             catch (Exception error)
             {

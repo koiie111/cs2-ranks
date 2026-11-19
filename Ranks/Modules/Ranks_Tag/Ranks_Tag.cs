@@ -1,10 +1,7 @@
 ﻿using System.Text.RegularExpressions;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
-using CounterStrikeSharp.API.Modules.Entities;
 using CounterStrikeSharp.API.Modules.Timers;
-using Dapper;
-using MySqlConnector;
 using RanksApi;
 
 namespace Ranks_Tag;

@@ -3,6 +3,7 @@ using CounterStrikeSharp.API.Modules.Entities;
 using Dapper;
 using MySqlConnector;
 using Ranks;
+using Ranks_ExStats_Hits;
 
 var random = new Random(329);
 foreach (var size in new[] { 0, 1, 5, 25, 100 })
@@ -27,6 +28,17 @@ foreach (var size in new[] { 0, 1, 5, 25, 100 })
 }
 
 Console.WriteLine("Rank lookup and legacy rank notification parity passed (108000 cases).");
+var clockId = new SteamID(76561197960265729UL);
+var clockUser = new User { steam = clockId.SteamId2, name = "Clock" };
+var session = new Ranks.Ranks.Session(clockId);
+var first = Ranks.Ranks.CaptureSave(session, clockUser, session.StartedAt + Stopwatch.Frequency * 56 / 10, 1, "stats");
+var second = Ranks.Ranks.CaptureSave(session, clockUser, session.StartedAt + Stopwatch.Frequency * 112 / 10, 2, "stats");
+var fresh = new Ranks.Ranks.Session(clockId, new Ranks.Ranks.ResetNotice(default));
+var resetSave = Ranks.Ranks.CaptureSave(fresh, clockUser, fresh.StartedAt, 3, "stats");
+if (first.Playtime.TotalSeconds != 5 || second.Playtime.TotalSeconds != 6 ||
+    Ranks.Ranks.CombineSaves(first, second)?.Playtime.TotalSeconds != 11 ||
+    Ranks.Ranks.CombineSaves(second, resetSave) != null)
+    throw new InvalidOperationException("Fractional timer drift or coalescing across a reset");
 await DatabaseQueueChecks.Run();
 var config = GenerateRanks(25);
 var thresholds = new RankThresholds(config);
@@ -53,7 +65,14 @@ if (args is ["--database"])
     try
     {
         await database.CreateTable();
-        await database.AddUserToDb("Test player", steamId.SteamId2);
+        var firstJoins = await Task.WhenAll(Enumerable.Range(0, 24)
+            .Select(_ => database.LoadOrCreateUser(table, "Test player", steamId.SteamId2, 42)));
+        if (firstJoins.Any(row => row.value != 42) ||
+            await connection.ExecuteScalarAsync<int>($"SELECT COUNT(*) FROM `{table}`") != 1)
+            throw new InvalidOperationException("Concurrent first joins created duplicate users");
+        var returning = await database.LoadOrCreateUser(table, "New name", steamId.SteamId2, 999);
+        if (returning.value != 42) throw new InvalidOperationException("Returning player was reinitialized");
+        Console.WriteLine("24 concurrent first joins and returning player lookup passed.");
         var snapshot = await database.GetUserStatsFromDb(steamId.SteamId2) ??
             throw new InvalidOperationException("Missing initial row");
         snapshot.value = 123;
@@ -72,21 +91,52 @@ if (args is ["--database"])
         var beforeReset = await database.GetUserStatsFromDb(steamId.SteamId2);
         if (beforeReset is not { playtime: 7, value: 123 }) throw new InvalidOperationException("Incorrect combined save");
 
-        var reset = typeof(Database).GetMethod("ResetPlayerData",
-            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
-        await (Task)reset.Invoke(database, new object[] { steamId.SteamId2, 42, table })!;
+        await database.ResetPlayerData(steamId.SteamId2);
         var afterReset = await database.GetUserStatsFromDb(steamId.SteamId2);
         if (afterReset is not { playtime: 0, value: 42 }) throw new InvalidOperationException("Incorrect reset");
         await database.UpdateUserStatsDb(steamId, afterReset, TimeSpan.FromSeconds(3), 3);
         var reconnected = await database.GetUserStatsFromDb(steamId.SteamId2);
         if (reconnected is not { playtime: 3, value: 42 }) throw new InvalidOperationException("Incorrect post-reset save");
-        Console.WriteLine("MariaDB delayed save, additive playtime, reset and subsequent reload passed.");
+        // The first acknowledged snapshot after a reset replaces session time. Replaying it is idempotent.
+        for (var attempt = 0; attempt < 2; attempt++)
+            if (!await database.UpdateUserStatsDb(steamId, afterReset, TimeSpan.FromSeconds(2), 4, table,
+                    replacePlaytime: true)) throw new InvalidOperationException("Absolute reset write failed");
+        await database.UpdateUserStatsDb(steamId, afterReset, TimeSpan.FromSeconds(5), 5);
+        if (await database.GetUserStatsFromDb(steamId.SteamId2) is not { playtime: 7 })
+            throw new InvalidOperationException("Replaying the reset snapshot doubled session time");
+        if (await database.GetPlayerRankAndTotal(steamId.SteamId2) is not { PlayerRank: 1, TotalPlayers: 1 })
+            throw new InvalidOperationException("Rank or total is incorrect");
+        Console.WriteLine("MariaDB delayed save, additive playtime, idempotent reset and subsequent reload passed.");
         await DatabaseQueueChecks.RunMariaDb(database, new Database(plugin, connectionString),
             connectionString, table, steamId);
+
+        var hitsTable = table + "_hits";
+        var store = new HitStatisticsStore(connectionString, hitsTable);
+        await store.CreateTable();
+        var hits = await store.Load("player");
+        hits[HitData.HdDmgHealth] = 99;
+        hits[HitData.HdDmgArmor] = 40;
+        hits[HitData.HdHitHead] = 2;
+        hits[HitData.HdHitAll] = 3; // Includes a generic hit without a body part.
+        await store.Save(hits, "player");
+        if ((await store.Load("player"))[HitData.HdHitAll] != 3)
+            throw new InvalidOperationException("Generic hit lost after reconnect");
+        await connection.ExecuteAsync($"ALTER TABLE `{hitsTable}` DROP COLUMN AllHits");
+        hits = await store.Load("player");
+        if (hits[HitData.HdHitAll] != 2) throw new InvalidOperationException("Legacy hit count includes damage");
+        await store.Save(hits, "player");
+        await connection.ExecuteAsync($"ALTER TABLE `{hitsTable}` ADD COLUMN AllHits INT NULL");
+        hits = await store.Load("player");
+        if (hits[HitData.HdHitAll] != 2) throw new InvalidOperationException("Migrated hit count lost");
+        hits[HitData.HdHitAll]++;
+        await store.Save(hits, "player");
+        if ((await store.Load("player"))[HitData.HdHitAll] != 3)
+            throw new InvalidOperationException("Migrated total was not persisted");
+        Console.WriteLine("New, legacy and migrated hit statistics round trips passed.");
     }
     finally
     {
-        await connection.ExecuteAsync($"DROP TABLE IF EXISTS `{table}`");
+        await connection.ExecuteAsync($"DROP TABLE IF EXISTS `{table}_hits`, `{table}`");
     }
 }
 

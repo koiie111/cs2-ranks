@@ -12,6 +12,7 @@ internal static class DatabaseQueueChecks
     {
         await ReloadWaitsForFinalWrite();
         await SlowWriteDoesNotBlockOtherPlayers();
+        await MassDisconnectLeavesRoomForLoads();
         Console.WriteLine("Database queue reload handoff, slow-write isolation, snapshot coalescing and reset order passed.");
     }
 
@@ -62,6 +63,40 @@ internal static class DatabaseQueueChecks
         if (await reloaded.Task is not { value: 130 } row || row.playtime != oldRow.playtime + 155)
             throw new InvalidOperationException("Reload lost experience or queued playtime");
         Console.WriteLine("MariaDB locked-row reload and concurrent authorization of another SteamID passed.");
+    }
+
+    private static async Task MassDisconnectLeavesRoomForLoads()
+    {
+        const int players = 48;
+        var full = Signal();
+        var release = Signal();
+        var loaded = Signal();
+        var active = 0;
+        var finished = 0;
+        var peak = 0;
+        var gate = new object();
+        var queue = Queue(async _ =>
+        {
+            lock (gate)
+            {
+                peak = Math.Max(peak, ++active);
+                if (active == PlayerDatabaseQueue<Snapshot>.MaxConcurrentWrites) full.TrySetResult();
+            }
+            await release.Task;
+            lock (gate) { active--; finished++; }
+        });
+        for (ulong id = 1; id <= players; id++) queue.Save(id, default);
+        try
+        {
+            await full.Task.WaitAsync(Timeout);
+            queue.Run(players + 1, () => { loaded.TrySetResult(); return Task.CompletedTask; });
+            await loaded.Task.WaitAsync(Timeout);
+        }
+        finally { release.TrySetResult(); }
+        await Drain(queue);
+        if (peak != PlayerDatabaseQueue<Snapshot>.MaxConcurrentWrites || finished != players)
+            throw new InvalidOperationException($"Mass disconnect had {peak} concurrent and {finished} completed writes");
+        Console.WriteLine($"48 disconnect snapshots drained with {peak} concurrent writes and an independent login.");
     }
 
     private static async Task ReloadWaitsForFinalWrite()
