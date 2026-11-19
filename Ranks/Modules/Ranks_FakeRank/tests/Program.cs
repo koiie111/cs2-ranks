@@ -1,5 +1,6 @@
 using Ranks_FakeRank;
 using CounterStrikeSharp.API;
+using System.Runtime.InteropServices;
 
 var ranks = new Dictionary<int, int> { [1] = 10, [2] = 20, [18] = 180 };
 var max = RankProjection.MaxRank(ranks);
@@ -18,16 +19,33 @@ Check(!RankProjection.TryProject(0, -1, ranks, max, out _), "unloaded XP is not 
 Check(!RankProjection.TryProject(1, -1, ranks, max, out _), "unloaded rank is not sent");
 Check(RankProjection.TryProject(0, 0, ranks, max, out var zero) && zero == 0, "loaded zero XP");
 Check(RankProjection.TryProject(1, 0, ranks, max, out var first) && first == 10, "loaded zero rank retains mapping");
+Check(RankProjection.TryProject(0, 100000, ranks, max, out var xp) && xp == 99999, "loaded XP clamp");
+Check(RankProjection.TryProject(1, 90, ranks, max, out var icon) && icon == 180, "custom rank upper clamp");
+Check(RankProjection.TryProject(1, 1, new Dictionary<int, int> { [1] = 120000 }, 1, out var capped) && capped == 99999, "custom value clamp");
+Check(!RankProjection.TryProject(1, 3, ranks, max, out _), "missing rank mapping withheld");
+Check(!RankProjection.TryProject(1, 1, new Dictionary<int, int>(), 1, out _), "empty rank mapping withheld");
 
-var connection = new PlayerIdentity(76561198000000001, 1, (nint)0x1000);
+// Offsets come from the server schema. Exercise discontiguous fields and their exact widths.
+var address = Marshal.AllocHGlobal(32);
+try
+{
+    Marshal.WriteInt32(address, 20, 111);
+    Marshal.WriteInt32(address, 4, 0x010203fe);
+    Marshal.WriteInt32(address, 12, 99999);
+    Check(new RankFieldLayout(20, 4, 12).Read(address) == new RankValues(111, -2, 99999), "native field read");
+}
+finally { Marshal.FreeHGlobal(address); }
+
+var connection = new PlayerIdentity(76561198000000001, 1, 0x1001);
 var desired = new AppliedRank(connection, new RankValues(111, 11, 12345));
 var state = new RankReplication();
+AppliedRank? notified = null;
 var fields = new FakeFields();
-Check(state.Apply(0, desired, fields), "first apply");
+Check(state.Apply(ref notified, desired, fields), "first apply");
 Check(fields.Live == desired.Values && fields.Writes == 1, "full triple written");
 Check(fields.Notified.SequenceEqual(new[] { RankFields.Wins, RankFields.Type, RankFields.Value }), "all fields notified initially");
-Check(state.LastNotified(0) == desired, "successful notify cached");
-for (var tick = 0; tick < 640; tick++) Check(!state.Apply(0, desired, fields), "unchanged tick skipped");
+Check(notified == desired, "successful notify cached");
+for (var tick = 0; tick < 640; tick++) Check(!state.Apply(ref notified, desired, fields), "unchanged tick skipped");
 Check(fields.Writes == 1 && state.Notifications == 3, "no per-tick writes or notifications");
 
 // Exercise all combinations of engine drift, not only the XP field.
@@ -35,7 +53,7 @@ for (var mask = 1; mask < 8; mask++)
 {
     fields.Live = new RankValues((mask & 1) != 0 ? 0 : 111, (sbyte)((mask & 2) != 0 ? 0 : 11), (mask & 4) != 0 ? 0 : 12345);
     fields.Notified.Clear();
-    Check(state.Apply(0, desired, fields), "engine drift repaired");
+    Check(state.Apply(ref notified, desired, fields), "engine drift repaired");
     Check(fields.Live == desired.Values, "drift restored full triple");
     Check(fields.Notified.Aggregate(RankFields.None, (a, b) => a | b) == (RankFields)mask, "only drifted fields notified");
 }
@@ -43,53 +61,65 @@ Check(state.DriftRepairs == 7, "drift counter");
 
 var updated = desired with { Values = desired.Values with { Value = 12346 } };
 fields.Notified.Clear();
-Check(state.Apply(0, updated, fields), "XP change with TAB held");
+Check(state.Apply(ref notified, updated, fields), "XP change with TAB held");
 Check(fields.Notified.SequenceEqual(new[] { RankFields.Value }), "XP change notifies rank only");
 // Another writer can already have changed live memory. The last-notified state
 // still differs, so a matching read must not suppress the network notification.
 fields.Live = desired.Values;
 fields.Notified.Clear();
-Check(state.Apply(0, desired, fields) && fields.Notified.SequenceEqual(new[] { RankFields.Value }), "desired change requires notify even if live matches");
+Check(state.Apply(ref notified, desired, fields) && fields.Notified.SequenceEqual(new[] { RankFields.Value }), "desired change requires notify even if live matches");
 
 foreach (var identity in new[]
 {
     connection with { SteamId = connection.SteamId + 1 },
     connection with { UserId = 2 },
-    connection with { Controller = (nint)0x2000 }
+    connection with { Controller = connection.Controller + (1u << 15) }
 })
 {
     fields.Notified.Clear();
-    Check(state.Apply(0, desired with { Identity = identity }, fields), "slot reuse or new controller");
+    Check(state.Apply(ref notified, desired with { Identity = identity }, fields), "slot reuse or new controller");
     Check(fields.Notified.Count == 3, "new identity notifies identical values");
 }
-state.Remove(0);
+notified = null;
 fields.Notified.Clear();
-Check(state.Apply(0, desired, fields) && fields.Notified.Count == 3, "disconnect clears notification state");
-state.Clear();
-Check(state.LastNotified(0) == null && state.Apply(0, desired, fields), "map/config reset clears notification state");
+Check(state.Apply(ref notified, desired, fields) && fields.Notified.Count == 3, "fresh session notifies even when all fields match");
 fields.Notified.Clear();
-Check(state.Apply(0, desired, fields, force: true) && fields.Notified.Count == 3, "spawn forces full notify");
+Check(state.Apply(ref notified, desired, fields, force: true) && fields.Notified.Count == 3, "spawn forces full notify");
 
 // Distinct slots/identities must never share a rank or notification cache.
 var other = new AppliedRank(connection with { SteamId = connection.SteamId + 10, UserId = 10 }, new RankValues(111, 12, 18));
 var otherFields = new FakeFields();
-Check(state.Apply(1, other, otherFields), "second player initialized");
+AppliedRank? otherNotified = null;
+Check(state.Apply(ref otherNotified, other, otherFields), "second player initialized");
 Check(fields.Live == desired.Values && otherFields.Live == other.Values, "player values remain separate");
-Check(state.LastNotified(0) == desired && state.LastNotified(1) == other, "per-slot cache isolation");
+Check(notified == desired && otherNotified == other, "per-slot cache isolation");
 
 foreach (var failure in new[] { RankFields.Wins, RankFields.Type, RankFields.Value })
 {
     var failedState = new RankReplication();
+    AppliedRank? failedNotification = null;
     var failingFields = new FakeFields { FailOn = failure };
     var threw = false;
-    try { failedState.Apply(0, desired, failingFields); }
+    try { failedState.Apply(ref failedNotification, desired, failingFields); }
     catch (InvalidOperationException) { threw = true; }
     Check(threw && failedState.Failures == 1, "notification failure reported");
-    Check(failedState.LastNotified(0) == null, "partial notification never cached as success");
+    Check(failedNotification == null, "partial notification never cached as success");
     failingFields.FailOn = RankFields.None;
     failingFields.Notified.Clear();
-    Check(failedState.Apply(0, desired, failingFields), "failed notification retried despite matching live memory");
+    Check(failedState.Apply(ref failedNotification, desired, failingFields), "failed notification retried despite matching live memory");
     Check(failingFields.Notified.Count == 3, "retry notifies full triple");
+
+    foreach (var force in new[] { false, true })
+    {
+        if (!force) failingFields.Live = default;
+        failingFields.FailOn = failure;
+        try { failedState.Apply(ref failedNotification, desired, failingFields, force); }
+        catch (InvalidOperationException) { }
+        Check(failedNotification == null && failingFields.Live == desired.Values, "established notification invalidated");
+        failingFields.FailOn = RankFields.None;
+        failingFields.Notified.Clear();
+        Check(failedState.Apply(ref failedNotification, desired, failingFields) && failingFields.Notified.Count == 3, "failed drift/spawn retried on next normal tick");
+    }
 }
 Console.WriteLine("FakeRank projection, 640 steady ticks, drift combinations, lifecycle, multi-player isolation and failure-retry checks passed");
 
