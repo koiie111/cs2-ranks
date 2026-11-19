@@ -1,7 +1,6 @@
 ﻿using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
-using System.Threading.Channels;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes;
@@ -38,8 +37,9 @@ public class Ranks : BasePlugin
 
     public readonly ConcurrentDictionary<ulong, User> Users = new();
     private readonly Dictionary<int, Session> _sessions = new();
-    private readonly Channel<Func<Task>> _databaseWork = Channel.CreateUnbounded<Func<Task>>(
-        new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+    private const string DatabaseHandoffKey = "cs2-ranks:core:database-drain";
+    private PlayerDatabaseQueue<SaveRequest>? _databaseWork;
+    private Task _tableReady = Task.CompletedTask;
     private bool _unloaded;
 
     private sealed class Session(SteamID steamId)
@@ -64,8 +64,11 @@ public class Ranks : BasePlugin
         _thresholds = new RankThresholds(Config.Ranks);
         DbConnectionString = BuildConnectionString();
         Database = new Database(this, DbConnectionString);
-        _databaseWork.Writer.TryWrite(Database.CreateTable);
-        _ = Task.Run(ProcessDatabaseWork);
+        var previous = AppDomain.CurrentDomain.GetData(DatabaseHandoffKey) as Dictionary<ulong, Task>;
+        AppDomain.CurrentDomain.SetData(DatabaseHandoffKey, null);
+        _databaseWork = new PlayerDatabaseQueue<SaveRequest>(Save, CombineSaves,
+            error => Logger.LogError(error, "Ranks database operation failed"), previous);
+        _tableReady = Task.Run(Database.CreateTable);
 
         AddCommandListener("say", CommandListener_Say);
         AddCommandListener("say_team", CommandListener_Say);
@@ -100,18 +103,11 @@ public class Ranks : BasePlugin
 
     public override void Unload(bool hotReload)
     {
+        if (_databaseWork is not { } work) return;
         UpdateUserStatsTimer();
         _unloaded = true;
-        _databaseWork.Writer.TryComplete();
-    }
-
-    private async Task ProcessDatabaseWork()
-    {
-        await foreach (var work in _databaseWork.Reader.ReadAllAsync())
-        {
-            try { await work(); }
-            catch (Exception error) { Logger.LogError(error, "Ranks database operation failed"); }
-        }
+        AppDomain.CurrentDomain.SetData(DatabaseHandoffKey, work.Seal());
+        _databaseWork = null;
     }
     
     [ConsoleCommand("css_rank")]
@@ -250,11 +246,12 @@ public class Ranks : BasePlugin
         FinishSession(slot);
         var session = new Session(id);
         _sessions[slot] = session;
-        _databaseWork.Writer.TryWrite(() => LoadSession(slot, playerName, session));
+        _databaseWork!.Run(id.SteamId64, () => LoadSession(slot, playerName, session));
     }
     
     private async Task LoadSession(int slot, string playerName, Session session)
     {
+        await _tableReady.ConfigureAwait(false);
         var steamId = session.SteamId;
         var userExists = await Database.UserExists(steamId.SteamId2);
 
@@ -280,30 +277,33 @@ public class Ranks : BasePlugin
         if (_sessions.Count == 0) return;
         var now = Stopwatch.GetTimestamp();
         var lastConnect = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var saves = new List<SaveRequest>(_sessions.Count);
+        var table = Config.TableName;
         foreach (var session in _sessions.Values)
         {
             if (Users.TryGetValue(session.SteamId.SteamId64, out var user))
-                saves.Add(CaptureSave(session, user, now, lastConnect));
+                _databaseWork!.Save(session.SteamId.SteamId64, CaptureSave(session, user, now, lastConnect, table));
         }
-        if (saves.Count != 0)
-            _databaseWork.Writer.TryWrite(async () =>
-            {
-                foreach (var save in saves) await Save(save);
-            });
     }
 
-    private readonly record struct SaveRequest(SteamID SteamId, User Snapshot, TimeSpan Playtime, long LastConnect);
+    private readonly record struct SaveRequest(SteamID SteamId, User Snapshot, TimeSpan Playtime, long LastConnect,
+        string Table);
 
-    private static SaveRequest CaptureSave(Session session, User user, long now, long lastConnect)
+    private static SaveRequest CaptureSave(Session session, User user, long now, long lastConnect, string table)
     {
         var elapsed = Stopwatch.GetElapsedTime(session.SavedAt, now);
         session.SavedAt = now;
-        return new SaveRequest(session.SteamId, user.Snapshot(), elapsed, lastConnect);
+        return new SaveRequest(session.SteamId, user.Snapshot(), elapsed, lastConnect, table);
     }
 
-    private Task Save(SaveRequest save) =>
-        Database.UpdateUserStatsDb(save.SteamId, save.Snapshot, save.Playtime, save.LastConnect);
+    private static SaveRequest? CombineSaves(SaveRequest older, SaveRequest newer) =>
+        older.Table == newer.Table ? newer with { Playtime = older.Playtime + newer.Playtime } : null;
+
+    private async Task Save(SaveRequest save)
+    {
+        await _tableReady.ConfigureAwait(false);
+        await Database.UpdateUserStatsDb(save.SteamId, save.Snapshot, save.Playtime, save.LastConnect, save.Table)
+            .ConfigureAwait(false);
+    }
 
     private HookResult EventWeaponFire(EventWeaponFire @event, GameEventInfo info)
     {
@@ -440,8 +440,9 @@ public class Ranks : BasePlugin
         if (!_sessions.Remove(slot, out var session) ||
             !Users.TryRemove(session.SteamId.SteamId64, out var user)) return;
         if (name != null) user.name = name;
-        var save = CaptureSave(session, user, Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow.ToUnixTimeSeconds());
-        _databaseWork.Writer.TryWrite(() => Save(save));
+        var save = CaptureSave(session, user, Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            Config.TableName);
+        _databaseWork!.Save(session.SteamId.SteamId64, save);
     }
 
     private HookResult EventRoundStart(EventRoundStart @event, GameEventInfo info)
@@ -580,7 +581,7 @@ public class Ranks : BasePlugin
         var steamId2 = session.SteamId.SteamId2;
         var initialExperience = Config.InitialExperiencePoints;
         var table = Config.TableName;
-        _databaseWork.Writer.TryWrite(() => Database.ResetPlayerData(steamId2, initialExperience, table));
+        _databaseWork!.Run(session.SteamId.SteamId64, () => Database.ResetPlayerData(steamId2, initialExperience, table));
         Users[player.SteamID] = new User
         {
             steam = steamId2.ReplaceFirstCharacter(),

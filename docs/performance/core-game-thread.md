@@ -11,7 +11,7 @@ The rank calculation benchmark uses the original algorithm and the new table wit
 | 24 | 235.94 ms → 0.445 ms | 548,829,584 → 0 B |
 | 48 | 453.10 ms → 0.861 ms | 1,094,081,472 → 0 B |
 
-CounterStrikeSharp work removed by inspection: rule-proxy enumeration per combat update, repeated player enumeration in the same tick, rank sorting per update, periodic per-player task dispatch, and Tag notifications when the clan already matches. Timing for full callbacks and timer bursts requires a CS2 capture.
+CounterStrikeSharp work removed by inspection: rule-proxy enumeration per combat update, repeated player enumeration in the same tick, rank sorting per update, and Tag notifications when the clan already matches. Core persistence runs one background drain per active SteamID and coalesces adjacent pending saves. Load and reset delimit coalescing. Unload publishes outstanding drain tasks so the next plugin instance can wait for the corresponding player off the game thread. ExStats Hits uses the same ordering with a separate handoff.
 
 ```sh
 dotnet build Ranks/Ranks.sln -c Release
@@ -19,6 +19,6 @@ dotnet run -c Release --project Ranks/Ranks/tests/CoreChecks.csproj
 dotnet run -c Release --project Ranks/Modules/Ranks_FakeRank/tests/FakeRankChecks.csproj
 ```
 
-The optional CoreChecks argument `--database` requires an isolated MariaDB instance on loopback port 43316 with a disposable `ranks_perf_check` database and passwordless local test root. The check uses a disposable table, delays a save with a write lock, checks consecutive playtime increments, resets the row, and reads it back after another save. It exercises SQL, not the engine callbacks.
+The optional CoreChecks argument `--database` requires an isolated MariaDB instance on loopback port 43316 with a disposable `ranks_perf_check` database and passwordless local test root. The check also holds one player's row lock while a replacement queue requests their stats, verifies a different SteamID can load, and checks the final XP and combined playtime after releasing the lock. Queue handoff is tested with replacement instances outside the engine. The server #34 A/B, including its timer numbers, applies to the original tested PR artifact `404237a`.
 
 A playtime write whose submission outcome is uncertain is not replayed. A failure before SQL submission is carried into the next write for that row in the same plugin lifetime. Existing `shoots` and `hits` values are retained. New fire events increment `shoots` and accepted damage events increment `hits`, so historical totals may contain both conventions.

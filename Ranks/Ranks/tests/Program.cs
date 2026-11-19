@@ -27,6 +27,7 @@ foreach (var size in new[] { 0, 1, 5, 25, 100 })
 }
 
 Console.WriteLine("Rank lookup and legacy rank notification parity passed (108000 cases).");
+await DatabaseQueueChecks.Run();
 var config = GenerateRanks(25);
 var thresholds = new RankThresholds(config);
 Console.WriteLine("Rank calculation only. Elapsed ms and thread allocations, 1000 simulated ticks.");
@@ -80,6 +81,8 @@ if (args is ["--database"])
         var reconnected = await database.GetUserStatsFromDb(steamId.SteamId2);
         if (reconnected is not { playtime: 3, value: 42 }) throw new InvalidOperationException("Incorrect post-reset save");
         Console.WriteLine("MariaDB delayed save, additive playtime, reset and subsequent reload passed.");
+        await DatabaseQueueChecks.RunMariaDb(database, new Database(plugin, connectionString),
+            connectionString, table, steamId);
     }
     finally
     {

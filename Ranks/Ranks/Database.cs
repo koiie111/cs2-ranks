@@ -9,7 +9,8 @@ public class Database
 {
     private readonly Ranks _ranks;
     private readonly string _dbConnectionString;
-    private readonly Dictionary<(string Table, string Steam), TimeSpan> _unsentPlaytime = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(string Table, string Steam), TimeSpan>
+        _unsentPlaytime = new();
 
     public Database(Ranks ranks, string connection)
     {
@@ -17,12 +18,14 @@ public class Database
         _dbConnectionString = connection;
     }
 
-    public async Task UpdateUserStatsDb(SteamID steamId, User user, TimeSpan playtime, long lastconnect)
+    public Task UpdateUserStatsDb(SteamID steamId, User user, TimeSpan playtime, long lastconnect) =>
+        UpdateUserStatsDb(steamId, user, playtime, lastconnect, _ranks.Config.TableName);
+
+    internal async Task UpdateUserStatsDb(SteamID steamId, User user, TimeSpan playtime, long lastconnect, string table)
     {
-        var table = _ranks.Config.TableName;
         var steam = steamId.SteamId2.ReplaceFirstCharacter();
         var key = (table, steam);
-        if (_unsentPlaytime.Remove(key, out var pending)) playtime += pending;
+        if (_unsentPlaytime.TryRemove(key, out var pending)) playtime += pending;
         var submitted = false;
         try
         {
@@ -148,7 +151,7 @@ public class Database
     internal async Task ResetPlayerData(string steamId, int initialExperience, string table)
     {
         steamId = steamId.ReplaceFirstCharacter();
-        _unsentPlaytime.Remove((table, steamId));
+        _unsentPlaytime.TryRemove((table, steamId), out _);
         try
         {
             await using var dbConnection = new MySqlConnection(_dbConnectionString);

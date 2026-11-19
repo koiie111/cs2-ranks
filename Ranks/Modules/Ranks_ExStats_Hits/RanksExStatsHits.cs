@@ -3,7 +3,9 @@ using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Modules.Entities;
 using CounterStrikeSharp.API.Modules.Menu;
 using Dapper;
+using Microsoft.Extensions.Logging;
 using MySqlConnector;
+using Ranks;
 using RanksApi;
 
 namespace Ranks_ExStats_Hits;
@@ -18,7 +20,9 @@ public class RanksExStatsHits : BasePlugin
     private readonly Dictionary<int, SteamID> _connections = new();
     private long _generation;
     private readonly Dictionary<int, long> _versions = new();
-    private Task _databaseTail = Task.CompletedTask;
+    private const string DatabaseHandoffKey = "cs2-ranks:hits:database-drain";
+    private PlayerDatabaseQueue<SaveRequest>? _databaseWork;
+    private Task _tableReady = Task.CompletedTask;
     private bool _unloaded;
     private IRanksApi? _api;
 
@@ -27,7 +31,12 @@ public class RanksExStatsHits : BasePlugin
         _api = IRanksApi.Capability.Get();
         if (_api == null) return;
 
-        Enqueue(CreateTable);
+        var previous = AppDomain.CurrentDomain.GetData(DatabaseHandoffKey) as Dictionary<ulong, Task>;
+        AppDomain.CurrentDomain.SetData(DatabaseHandoffKey, null);
+        _databaseWork = new PlayerDatabaseQueue<SaveRequest>(
+            save => SavePlayerData(save.Hits, save.SteamId), (_, newer) => newer,
+            error => Logger.LogError(error, "Ranks hit statistics database operation failed"), previous);
+        _tableReady = Task.Run(CreateTable);
         
         RegisterListener<Listeners.OnClientAuthorized>(OnAuthorized);
         RegisterListener<Listeners.OnClientDisconnect>(OnDisconnect);
@@ -45,15 +54,14 @@ public class RanksExStatsHits : BasePlugin
     public override void Unload(bool hotReload)
     {
         if (_api != null) _api.CreatedMenu -= OnCreatedMenu;
+        if (_databaseWork is not { } work) return;
         foreach (var slot in _connections.Keys.ToArray()) OnDisconnect(slot);
         _unloaded = true;
+        AppDomain.CurrentDomain.SetData(DatabaseHandoffKey, work.Seal());
+        _databaseWork = null;
     }
 
-    private void Enqueue(Func<Task> operation)
-    {
-        _databaseTail = _databaseTail.ContinueWith(_ => operation(), CancellationToken.None,
-            TaskContinuationOptions.None, TaskScheduler.Default).Unwrap();
-    }
+    private readonly record struct SaveRequest(Dictionary<HitData, int> Hits, SteamID SteamId);
 
     private void OnCreatedMenu(CCSPlayerController player, IMenu menu)
     {
@@ -126,7 +134,7 @@ public class RanksExStatsHits : BasePlugin
         var generation = ++_generation;
         _connections[slot] = id;
         _versions[slot] = generation;
-        Enqueue(() => LoadHitsFromDatabase(slot, generation, id));
+        _databaseWork!.Run(id.SteamId64, () => LoadHitsFromDatabase(slot, generation, id));
     }
 
     private void OnDisconnect(int slot)
@@ -136,7 +144,7 @@ public class RanksExStatsHits : BasePlugin
         if (Hits.Remove(slot, out var hits) && hasConnection)
         {
             var snapshot = new Dictionary<HitData, int>(hits);
-            Enqueue(() => SavePlayerData(snapshot, steamId!));
+            _databaseWork!.Save(steamId!.SteamId64, new SaveRequest(snapshot, steamId));
         }
     }
 
@@ -252,6 +260,7 @@ public class RanksExStatsHits : BasePlugin
     {
         try
         {
+            await _tableReady.ConfigureAwait(false);
             await using var connection = new MySqlConnection(_api?.DatabaseConnectionString);
             await connection.OpenAsync();
 
