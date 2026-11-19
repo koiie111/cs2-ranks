@@ -4,7 +4,7 @@ using System.Runtime.CompilerServices;
 
 namespace Ranks_FakeRank;
 
-internal readonly record struct PlayerIdentity(ulong SteamId, int? UserId, nint Controller);
+internal readonly record struct PlayerIdentity(ulong SteamId, int? UserId, uint Controller);
 internal readonly record struct RankValues(int Wins, sbyte Type, int Value);
 internal readonly record struct AppliedRank(PlayerIdentity Identity, RankValues Values);
 
@@ -14,7 +14,7 @@ internal enum RankFields { None = 0, Wins = 1, Type = 2, Value = 4, All = Wins |
 internal interface ICompetitiveRankFields
 {
     RankValues Read();
-    void Write(RankValues values);
+    void Write(RankValues values, RankFields dirty);
     void Notify(RankFields field);
 }
 
@@ -22,7 +22,6 @@ internal interface ICompetitiveRankFields
 // must be retried, and live drift must be repaired even when the cache is unchanged.
 internal sealed class RankReplication
 {
-    private readonly Dictionary<int, AppliedRank> _notified = new();
     public long Checks { get; private set; }
     public long Skipped { get; private set; }
     public long Applied { get; private set; }
@@ -30,35 +29,32 @@ internal sealed class RankReplication
     public long DriftRepairs { get; private set; }
     public long Failures { get; private set; }
 
-    public AppliedRank? LastNotified(int slot) => _notified.TryGetValue(slot, out var value) ? value : null;
-    public void Remove(int slot) => _notified.Remove(slot);
-    public void Clear() => _notified.Clear();
-
-    public bool Apply<T>(int slot, AppliedRank desired, T fields, bool force = false)
+    public bool Apply<T>(ref AppliedRank? notified, AppliedRank desired, T fields, bool force = false)
         where T : ICompetitiveRankFields
     {
         Checks++;
         try
         {
             var live = fields.Read();
-            var sameConnection = _notified.TryGetValue(slot, out var previous) && previous.Identity == desired.Identity;
-            var changed = sameConnection && !force
-                ? Difference(live, desired.Values) | Difference(previous.Values, desired.Values)
-                : RankFields.All;
-            if (changed == RankFields.None)
+            if (!force && live == desired.Values && notified == desired)
             {
                 Skipped++;
                 return false;
             }
 
-            // Write the complete triple before making any part eligible for a snapshot.
-            fields.Write(desired.Values);
+            var dirty = Difference(live, desired.Values);
+            var changed = RankFields.All;
+            if (!force && notified is { } previous && previous.Identity == desired.Identity)
+                changed = dirty | Difference(previous.Values, desired.Values);
+
+            // Make the whole triple coherent before the first notification.
+            if (dirty != RankFields.None) fields.Write(desired.Values, dirty);
             Notify(RankFields.Wins);
             Notify(RankFields.Type);
             Notify(RankFields.Value);
-            _notified[slot] = desired;
+            if (notified == desired && live != desired.Values) DriftRepairs++;
+            notified = desired;
             Applied++;
-            if (sameConnection && previous.Values == desired.Values && live != desired.Values) DriftRepairs++;
             return true;
 
             void Notify(RankFields field)
@@ -70,6 +66,9 @@ internal sealed class RankReplication
         }
         catch
         {
+            // A drift repair or forced spawn can fail after Write even for an
+            // already-notified rank. Matching live values must not hide that failure.
+            notified = null;
             Failures++;
             throw;
         }
