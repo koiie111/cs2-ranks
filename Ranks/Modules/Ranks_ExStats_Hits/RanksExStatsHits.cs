@@ -2,8 +2,8 @@
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Modules.Entities;
 using CounterStrikeSharp.API.Modules.Menu;
-using Dapper;
-using MySqlConnector;
+using Microsoft.Extensions.Logging;
+using Ranks;
 using RanksApi;
 
 namespace Ranks_ExStats_Hits;
@@ -15,6 +15,14 @@ public class RanksExStatsHits : BasePlugin
     public override string ModuleVersion => "v1.0.1";
 
     public readonly Dictionary<int, Dictionary<HitData, int>> Hits = new();
+    private readonly Dictionary<int, SteamID> _connections = new();
+    private long _generation;
+    private readonly Dictionary<int, long> _versions = new();
+    private const string DatabaseHandoffKey = "cs2-ranks:hits:database-drain";
+    private PlayerDatabaseQueue<SaveRequest>? _databaseWork;
+    private HitStatisticsStore _store = null!;
+    private Task _tableReady = Task.CompletedTask;
+    private bool _unloaded;
     private IRanksApi? _api;
 
     public override void OnAllPluginsLoaded(bool hotReload)
@@ -22,7 +30,13 @@ public class RanksExStatsHits : BasePlugin
         _api = IRanksApi.Capability.Get();
         if (_api == null) return;
 
-        Task.Run(CreateTable);
+        var previous = AppDomain.CurrentDomain.GetData(DatabaseHandoffKey) as Dictionary<ulong, Task>;
+        AppDomain.CurrentDomain.SetData(DatabaseHandoffKey, null);
+        _store = new HitStatisticsStore(_api.DatabaseConnectionString, _api.DatabaseTableName + "_hits");
+        _databaseWork = new PlayerDatabaseQueue<SaveRequest>(
+            save => _store.Save(save.Hits, ReplaceFirstCharacter(save.SteamId.SteamId2)), (_, newer) => newer,
+            error => Logger.LogError(error, "Ranks hit statistics database operation failed"), previous);
+        _tableReady = Task.Run(InitializeTable);
         
         RegisterListener<Listeners.OnClientAuthorized>(OnAuthorized);
         RegisterListener<Listeners.OnClientDisconnect>(OnDisconnect);
@@ -30,7 +44,24 @@ public class RanksExStatsHits : BasePlugin
         RegisterEventHandler<EventPlayerHurt>(EventPlayerHurt);
         
         _api.CreatedMenu += OnCreatedMenu;
+
+        if (hotReload)
+            foreach (var player in Utilities.GetPlayers())
+                if (!player.IsBot && player.AuthorizedSteamID is { } steamId)
+                    OnAuthorized(player.Slot, steamId);
     }
+
+    public override void Unload(bool hotReload)
+    {
+        if (_api != null) _api.CreatedMenu -= OnCreatedMenu;
+        if (_databaseWork is not { } work) return;
+        foreach (var slot in _connections.Keys.ToArray()) OnDisconnect(slot);
+        _unloaded = true;
+        AppDomain.CurrentDomain.SetData(DatabaseHandoffKey, work.Seal());
+        _databaseWork = null;
+    }
+
+    private readonly record struct SaveRequest(Dictionary<HitData, int> Hits, SteamID SteamId);
 
     private void OnCreatedMenu(CCSPlayerController player, IMenu menu)
     {
@@ -43,11 +74,9 @@ public class RanksExStatsHits : BasePlugin
         var subMenu = new ChatMenu("");
         subMenu.AddMenuOption("Back", OpenSubMenu);
 
-        var hits = Hits[player.Slot];
-        var allHits = hits[HitData.HdHitAll];
-        
-        if (allHits is not 0)
+        if (Hits.TryGetValue(player.Slot, out var hits) && hits[HitData.HdHitAll] is not 0)
         {
+            var allHits = hits[HitData.HdHitAll];
             var hitTitle = Localizer["hits"];
 
             menu.AddMenuOption(hitTitle, (controller, _) =>
@@ -83,8 +112,6 @@ public class RanksExStatsHits : BasePlugin
                 var health = hits[HitData.HdDmgHealth];
                 var armor = hits[HitData.HdDmgArmor];
 
-                allHits = health + armor;
-            
                 subMenu.AddMenuOption(Localizer["dmg_player",
                     health,
                     armor].Value.Replace('\n', '\u2029'), null!, true);
@@ -102,18 +129,29 @@ public class RanksExStatsHits : BasePlugin
     
     private void OnAuthorized(int slot, SteamID id)
     {
-        Task.Run(() => LoadHitsFromDatabase(slot, id));
+        if (_connections.TryGetValue(slot, out var current) && current.SteamId64 == id.SteamId64) return;
+        OnDisconnect(slot);
+        foreach (var (oldSlot, oldId) in _connections)
+        {
+            if (oldId.SteamId64 != id.SteamId64) continue;
+            OnDisconnect(oldSlot);
+            break;
+        }
+        var generation = ++_generation;
+        _connections[slot] = id;
+        _versions[slot] = generation;
+        _databaseWork!.Run(id.SteamId64, () => LoadHitsFromDatabase(slot, generation, id));
     }
 
     private void OnDisconnect(int slot)
     {
-        var player = Utilities.GetPlayerFromSlot(slot);
-        if (player is null || player.IsBot) return;
-
-        var steamId =
-            new SteamID(player.AuthorizedSteamID == null ? player.SteamID : player.AuthorizedSteamID.SteamId64);
-
-        Task.Run(() => SavePlayerData(slot, steamId));
+        _versions.Remove(slot);
+        var hasConnection = _connections.Remove(slot, out var steamId);
+        if (Hits.Remove(slot, out var hits) && hasConnection)
+        {
+            var snapshot = new Dictionary<HitData, int>(hits);
+            _databaseWork!.Save(steamId!.SteamId64, new SaveRequest(snapshot, steamId));
+        }
     }
 
     private HookResult EventPlayerHurt(EventPlayerHurt @event, GameEventInfo info)
@@ -128,147 +166,47 @@ public class RanksExStatsHits : BasePlugin
         hits[HitData.HdDmgArmor] += @event.DmgArmor;
 
         hits[HitData.HdHitAll]++;
-        hits[(HitData)@event.Hitgroup]++;
+        var group = (HitData)@event.Hitgroup;
+        if (group > HitData.HdHitAll && hits.TryGetValue(group, out var count))
+            hits[group] = count + 1;
 
         return HookResult.Continue;
     }
 
-    private async Task CreateTable()
+    private async Task InitializeTable()
     {
-        try
-        {
-            await using var connection = new MySqlConnection(_api?.DatabaseConnectionString);
-            await connection.OpenAsync();
-
-            var query = $"""
-                         CREATE TABLE IF NOT EXISTS `{_api?.DatabaseTableName}_hits`
-                         (`SteamID` varchar(32) NOT NULL PRIMARY KEY DEFAULT '',
-                         	`DmgHealth` int NOT NULL DEFAULT 0,
-                         	`DmgArmor` int NOT NULL DEFAULT 0,
-                         	`Head` int NOT NULL DEFAULT 0,
-                         	`Chest` int NOT NULL DEFAULT 0,
-                         	`Belly` int NOT NULL DEFAULT 0,
-                         	`LeftArm` int NOT NULL DEFAULT 0,
-                         	`RightArm` int NOT NULL DEFAULT 0,
-                         	`LeftLeg` int NOT NULL DEFAULT 0,
-                         	`RightLeg` int NOT NULL DEFAULT 0,
-                         	`Neak` int NOT NULL DEFAULT 0) CHARSET = utf8 COLLATE utf8_general_ci;
-                         """;
-
-            await connection.ExecuteAsync(query);
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine(e);
-        }
+        try { await _store.CreateTable(); }
+        catch (Exception error) { Logger.LogError(error, "Could not initialize the hit statistics table"); }
     }
 
-    private async Task AddPlayerToDatabase(string steamId)
+    private async Task LoadHitsFromDatabase(int slot, long generation, SteamID id)
     {
+        await _tableReady.ConfigureAwait(false);
+        Dictionary<HitData, int> hits;
         try
         {
-            await using var connection = new MySqlConnection(_api?.DatabaseConnectionString);
-            await connection.OpenAsync();
-
-            var query = $"INSERT INTO `{_api?.DatabaseTableName}_hits` (`SteamID`) VALUES (@SteamId);";
-
-            await connection.ExecuteAsync(query, new { SteamId = steamId });
+            hits = await _store.Load(ReplaceFirstCharacter(id.SteamId2));
         }
-        catch (Exception e)
+        catch (Exception error)
         {
-            Console.WriteLine(e);
-        }
-    }
-
-    private async Task SavePlayerData(int slot, SteamID steamId)
-    {
-        try
-        {
-            await using var connection = new MySqlConnection(_api?.DatabaseConnectionString);
-            await connection.OpenAsync();
-
-            var updateQuery = $@"
-                UPDATE `{_api?.DatabaseTableName}_hits`
-                SET DmgHealth = @DmgHealth,
-                    DmgArmor = @DmgArmor,
-                    Head = @Head,
-                    Chest = @Chest,
-                    Belly = @Belly,
-                    LeftArm = @LeftArm,
-                    RightArm = @RightArm,
-                    LeftLeg = @LeftLeg,
-                    RightLeg = @RightLeg,
-                    Neak = @Neak
-                WHERE SteamID = @SteamId;";
-
-            var hits = Hits[slot];
-            await connection.ExecuteAsync(updateQuery, new
+            if (error is MySqlConnector.MySqlException { Number: 1146 }) await InitializeTable();
+            Logger.LogError(error, "Could not load hits for {SteamId}. Retrying in 30 seconds", id.SteamId64);
+            Server.NextFrame(() =>
             {
-                DmgHealth = hits[HitData.HdDmgHealth],
-                DmgArmor = hits[HitData.HdDmgArmor],
-                Head = hits[HitData.HdHitHead],
-                Chest = hits[HitData.HdHitChest],
-                Belly = hits[HitData.HdHitBelly],
-                LeftArm = hits[HitData.HdHitLeftArm],
-                RightArm = hits[HitData.HdHitRightArm],
-                LeftLeg = hits[HitData.HdHitLeftLeg],
-                RightLeg = hits[HitData.HdHitRightLeg],
-                Neak = hits[HitData.HdHitNeak],
-                SteamId = ReplaceFirstCharacter(steamId.SteamId2)
+                if (_unloaded) return;
+                AddTimer(30f, () =>
+                {
+                    if (!_unloaded && _versions.TryGetValue(slot, out var current) && current == generation)
+                        _databaseWork!.Run(id.SteamId64, () => LoadHitsFromDatabase(slot, generation, id));
+                });
             });
-
-            Hits.Remove(slot);
+            return;
         }
-        catch (Exception e)
+        Server.NextFrame(() =>
         {
-            Console.WriteLine(e);
-        }
-    }
-
-    private async Task LoadHitsFromDatabase(int slot, SteamID id)
-    {
-        try
-        {
-            await using var connection = new MySqlConnection(_api?.DatabaseConnectionString);
-            await connection.OpenAsync();
-
-            var steamId = ReplaceFirstCharacter(id.SteamId2);
-
-            var query = $"SELECT * FROM `{_api?.DatabaseTableName}_hits` WHERE SteamId = @SteamId;";
-            var hitsData = await connection.QueryFirstOrDefaultAsync(query, new { SteamId = steamId });
-
-            Hits.Add(slot, Enum.GetValues(typeof(HitData)).Cast<HitData>().ToDictionary(hit => hit, hit => 0));
-
-            if (hitsData == null)
-            {
-                await AddPlayerToDatabase(steamId);
-                return;
-            }
-
-            Hits[slot] = new Dictionary<HitData, int>
-            {
-                [HitData.HdDmgHealth] = hitsData.DmgHealth,
-                [HitData.HdDmgArmor] = hitsData.DmgArmor,
-                [HitData.HdHitHead] = hitsData.Head,
-                [HitData.HdHitChest] = hitsData.Chest,
-                [HitData.HdHitBelly] = hitsData.Belly,
-                [HitData.HdHitLeftArm] = hitsData.LeftArm,
-                [HitData.HdHitRightArm] = hitsData.RightArm,
-                [HitData.HdHitLeftLeg] = hitsData.LeftLeg,
-                [HitData.HdHitRightLeg] = hitsData.RightLeg,
-                [HitData.HdHitNeak] = hitsData.Neak,
-                [HitData.HdHitAll] = 0
-            };
-
-            foreach (var (key, value) in Hits[slot])
-            {
-                Hits[slot][HitData.HdHitAll] += value;
-            }
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine(e);
-        }
+            if (!_unloaded && _versions.TryGetValue(slot, out var current) && current == generation)
+                Hits[slot] = hits;
+        });
     }
 
     private static string ReplaceFirstCharacter(string input)

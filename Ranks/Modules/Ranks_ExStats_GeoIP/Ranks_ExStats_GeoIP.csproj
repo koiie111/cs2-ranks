@@ -7,6 +7,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="../../Ranks/PlayerDatabaseQueue.cs" Link="PlayerDatabaseQueue.cs" />
     <ProjectReference Include="..\..\RanksApi\RanksApi.csproj" />
   </ItemGroup>
 
@@ -15,7 +16,7 @@
     <PackageReference Include="Dapper" Version="2.1.35" />
     <PackageReference Include="MaxMind.Db" Version="4.1.0" />
     <PackageReference Include="MaxMind.GeoIP2" Version="5.2.0" />
-    <PackageReference Include="MySqlConnector" Version="2.3.5" />
+    <PackageReference Include="MySqlConnector" Version="2.6.1" />
   </ItemGroup>
 
 </Project>

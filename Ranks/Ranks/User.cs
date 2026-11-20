@@ -2,6 +2,8 @@ namespace Ranks;
 
 public class User
 {
+    internal User Snapshot() => (User)MemberwiseClone();
+
     public required string steam { get; set; }
     public required string name { get; set; }
     public int value { get; set; } //exp
